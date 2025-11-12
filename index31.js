@@ -378,7 +378,35 @@ function maybeEmitPrint(optionMeta, row, isFuture, multiplier) {
     const aggressor = last >= ask ? true : (last <= bid ? false : (ask && bid ? (Math.abs(last - ask) < Math.abs(last - bid)) : true));
     const volOiRatio = oi > 0 ? volume / oi : volume;
     const premium = tradeSize * last * multiplier;
-    
+    // derive extra context for stance
+    const ulPx = null;  // if you have UL here pass it, else compute moneyness from known fields
+    let mny = null;
+    if (optionMeta.strike && ulPx) mny = optionMeta.strike / ulPx;
+
+    // If you cached greeks on last snapshot:
+    const delta = +row['7308'] || null;
+
+    // DTE
+    let dteDays = null;
+    if (optionMeta.expiry) {
+      const expDate = parseYYYYMMDD(String(optionMeta.expiry));
+      if (expDate) dteDays = Math.ceil((expDate - new Date())/86400000);
+    }
+
+    // Direction is unknown at print-time unless you pipe through your UW classifier.
+    // If you have it, pass it; otherwise leave undefined and the scorer still works.
+    const stance = stanceForOptionPrint({
+      right: optionMeta.right === 'C' ? 'CALL' : 'PUT',
+      aggressor,
+      direction: undefined,        // or your inferred 'BTO'|'STO'|'BTC'|'STC'
+      delta,
+      moneyness: mny,
+      dte: dteDays,
+      volOiRatio,
+      size: tradeSize,
+      premium
+    });
+
     broadcastAll({
       type: 'PRINT',
       conid,
@@ -393,8 +421,27 @@ function maybeEmitPrint(optionMeta, row, isFuture, multiplier) {
       aggressor,
       premium,
       volOiRatio,
-      timestamp: Date.now()
-    });
+      timestamp: Date.now(),
+      stance: stance.label,        // <-- NEW
+      stanceScore: stance.score,   // <-- NEW
+      stanceNotes: stance.notes    // <-- NEW (array of strings)
+    });    
+    // broadcastAll({
+    //   type: 'PRINT',
+    //   conid,
+    //   symbol: optionMeta.symbol,
+    //   right: optionMeta.right === 'C' ? 'CALL' : 'PUT',
+    //   strike: optionMeta.strike,
+    //   expiry: optionMeta.expiry,
+    //   tradePrice: last,
+    //   tradeSize,
+    //   bid,
+    //   ask,
+    //   aggressor,
+    //   premium,
+    //   volOiRatio,
+    //   timestamp: Date.now()
+    // });
   }
 }
 
@@ -598,7 +645,96 @@ async function buildEquityOptionSelection(symbol, underlyingPx) {
     return { ulConid: stkConid, options: [] };
   }
 }
+/* ---------------------- Bull/Bear stance for prints ---------------------- */
+/**
+ * Returns { label: 'BULL'|'BEAR'|'NEUTRAL'|'HEDGE?', score: -100..+100, notes:[] }
+ * Positive => bullish, Negative => bearish.
+//  */
+// function stanceForOptionPrint({ 
+//   right,                // 'CALL' | 'PUT'
+//   aggressor,            // true = BUY-agg, false = SELL-agg
+//   direction,            // 'BTO'|'STO'|'BTC'|'STC'|undefined  (if you have it)
+//   delta = null,         // from greeks if available
+//   moneyness = null,     // strike/UL (e.g. 1.03)
+//   dte = null,           // days to expiry
+//   volOiRatio = null,    // number
+//   size = 0,             // tradeSize
+//   premium = 0           // notional
+// }){
+//   let score = 0;
+//   const notes = [];
 
+//   // 1) Core intuition from right + aggressor
+//   // BUY calls ~ bullish; SELL calls ~ bearish; BUY puts ~ bearish; SELL puts ~ bullish
+//   if (right === 'CALL') {
+//     if (aggressor === true)  { score += 35; notes.push('BUY-agg CALL'); }
+//     else                     { score -= 35; notes.push('SELL-agg CALL'); }
+//   } else if (right === 'PUT') {
+//     if (aggressor === true)  { score -= 35; notes.push('BUY-agg PUT'); }
+//     else                     { score += 35; notes.push('SELL-agg PUT'); }
+//   }
+
+//   // 2) Directional intent if known (boost or flip weight)
+//   // Opening trades amplify; closing trades dampen or flip depending on side.
+//   if (direction) {
+//     if (direction === 'BTO' || direction === 'STO') { score *= 1.25; notes.push('OPENing size'); }
+//     if (direction === 'BTC' || direction === 'STC') { score *= 0.65; notes.push('CLOSE/roll'); }
+//   }
+
+//   // 3) Size & premium: institutional weight
+//   if (size >= 100)        { score *= 1.15; notes.push('size≥100'); }
+//   if (premium >= 100000)  { score *= 1.10; notes.push('prem≥100k'); }
+//   if (premium >= 1000000) { score *= 1.10; notes.push('prem≥1M'); }
+
+//   // 4) vol/OI spike => more “conviction”
+//   if (typeof volOiRatio === 'number') {
+//     if (volOiRatio >= 3) { score *= 1.25; notes.push('vol/OI≥3x'); }
+//     else if (volOiRatio >= 1) { score *= 1.10; notes.push('vol/OI≥1x'); }
+//   }
+
+//   // 5) Moneyness & delta nuance
+//   // - OTM call selling is more bearish (call-writing), OTM put selling more bullish (cash-secured).
+//   if (moneyness != null) {
+//     if (right === 'CALL') {
+//       if (moneyness > 1.05 && aggressor === false) { score -= 10; notes.push('OTM call write'); }
+//     } else if (right === 'PUT') {
+//       if (moneyness < 0.95 && aggressor === false) { score += 10; notes.push('OTM put sell'); }
+//     }
+//   }
+//   if (delta != null) {
+//     // OTM calls w/ low delta sold -> bearish; OTM puts w/ low delta sold -> bullish
+//     if (right === 'CALL' && delta < 0.30 && aggressor === false) { score -= 8; notes.push('low-Δ call write'); }
+//     if (right === 'PUT'  && delta > -0.30 && aggressor === false) { score += 6; notes.push('near-ATM put sell'); }
+//   }
+
+//   // 6) Short-dated gamma emphasis
+//   if (dte != null) {
+//     if (dte <= 3) { score *= 1.10; notes.push('0-3DTE'); }
+//     else if (dte <= 7) { score *= 1.05; notes.push('≤1W'); }
+//   }
+
+//   // 7) Hedge heuristic: big BUY-agg ATM puts often protection
+//   let hedge = false;
+//   if (right === 'PUT' && aggressor === true) {
+//     const atmish = (moneyness != null ? (moneyness > 0.97 && moneyness < 1.03) : true);
+//     if (atmish && size >= 100 && premium >= 100000 && (volOiRatio == null || volOiRatio >= 1)) {
+//       hedge = true;
+//       notes.push('hedge-like PUT buy');
+//     }
+//   }
+
+//   // Map to label
+//   let label = 'NEUTRAL';
+//   if (score >= 15) label = 'BULL';
+//   if (score <= -15) label = 'BEAR';
+//   if (hedge && label === 'BEAR') label = 'HEDGE?'; // communicate likely protection
+
+//   // Clamp score
+//   if (score > 100) score = 100;
+//   if (score < -100) score = -100;
+
+//   return { label, score: Math.round(score), notes };
+// }
 /* === helper: choose a YYYYMM for equities from the 'months' string === */
 function pickEquityYYYYMMFromMonthsString(monthsStr, { targetDte = 15 } = {}) {
   if (!monthsStr) return null;
@@ -646,28 +782,123 @@ async function captureUnderlying(ulConid) {
   broadcastLiveUL(ulConid, row);
   return { price: px(row['31']), row };
 }
+/* ===================== Bull/Bear Stance ===================== */
+/**
+ * Returns a stance score in [-100, +100] and a label "BULL"/"BEAR"/"NEUTRAL".
+ * Factors:
+ *  - Aggressor + Right (BUY-agg CALL ~ bull, BUY-agg PUT ~ bear, etc.)
+ *  - Direction (BTO/STO/BTC/STC) nudges score toward/away from open interest creation
+ *  - Premium size, vol/OI spike, short-dated DTE, delta magnitude, moneyness
+ */
+function stanceForOptionPrint({
+  right,            // 'CALL' | 'PUT'
+  aggressor,        // boolean (true=BUY-agg, false=SELL-agg)
+  direction,        // 'BTO'|'STO'|'BTC'|'STC'
+  delta,            // number | null
+  moneyness,        // strike / underlyingPrice  (≈1 = ATM, >1 call OTM / put ITM)
+  dte,              // integer days to expiry
+  volOiRatio,       // number (>=0)
+  size,             // contracts
+  premium           // dollars
+}){
+  const reasons = [];
 
+  // 1) Base from aggressor × right
+  // BUY-agg CALL = +35, SELL-agg CALL = -35, BUY-agg PUT = -35, SELL-agg PUT = +35
+  let base = 0;
+  if (right === 'CALL') {
+    base = aggressor ? +35 : -35;
+    reasons.push(`${aggressor ? 'BUY' : 'SELL'}-agg CALL`);
+  } else {
+    base = aggressor ? -35 : +35;
+    reasons.push(`${aggressor ? 'BUY' : 'SELL'}-agg PUT`);
+  }
+
+  // 2) Direction nudge (opening trades sway more than closing)
+  // BTO/STO influence 10 pts, BTC/STC 5 pts (weak).
+  const dirMap = { BTO: +10, STO: -10, BTC: +5, STC: -5 };
+  const dirNudge = dirMap[direction] ?? 0;
+  base += dirNudge;
+  if (dirNudge) reasons.push(`dir:${direction}`);
+
+  // 3) Premium magnitude (institutional heft)
+  if (premium >= 1_000_000) { base *= 1.20; reasons.push('prem≥1M'); }
+  else if (premium >= 100_000) { base *= 1.10; reasons.push('prem≥100k'); }
+
+  // 4) Volume/OI spike (unusualness)
+  if (volOiRatio != null) {
+    if (volOiRatio >= 5) { base *= 1.35; reasons.push('vol/OI≥5x'); }
+    else if (volOiRatio >= 3) { base *= 1.25; reasons.push('vol/OI≥3x'); }
+    else if (volOiRatio >= 1) { base *= 1.10; reasons.push('vol/OI≥1x'); }
+  }
+
+  // 5) Short-dated juice
+  if (Number.isFinite(dte)) {
+    if (dte <= 3) { base *= 1.25; reasons.push('DTE≤3'); }
+    else if (dte <= 7) { base *= 1.15; reasons.push('DTE≤7'); }
+  }
+
+  // 6) Delta magnitude: closer to 0.5 strengthens stance (ATM conviction)
+  if (Number.isFinite(delta)) {
+    const mag = Math.min(Math.abs(delta), 1);
+    // Emphasize |delta| in [0.3,0.7]
+    const weight = 0.9 + 0.3 * Math.exp(-Math.pow((mag - 0.5)/0.2, 2)); // ~[0.9,1.2]
+    base *= weight;
+    reasons.push(`|Δ|≈${mag.toFixed(2)}`);
+  }
+
+  // 7) Moneyness sanity: very far OTM softens stance a bit
+  if (Number.isFinite(moneyness) && moneyness > 0) {
+    // For calls: mny >> 1 means far OTM -> reduce; for puts: mny << 1 means far OTM -> reduce
+    const farOTMCall = right === 'CALL' && moneyness >= 1.15;
+    const farOTMPut  = right === 'PUT'  && moneyness <= 0.85;
+    if (farOTMCall || farOTMPut) {
+      base *= 0.9;
+      reasons.push('farOTM');
+    }
+  }
+
+  // 8) Size nudge (secondary to premium)
+  if (size >= 500) { base *= 1.10; reasons.push('size≥500'); }
+  else if (size >= 100) { base *= 1.05; reasons.push('size≥100'); }
+
+  // Clamp and label
+  const score = Math.max(-100, Math.min(100, Math.round(base)));
+  const label = score > 30 ? 'BULL' : score < -30 ? 'BEAR' : 'NEUTRAL';
+
+  return { score, label, reasons };
+}
+
+/* ===================== Trade Payload Builder ===================== */
 function buildTradePayload({ optionMeta, isFuture, ulConid, ul, optRow, multiplier }){
-  const last = px(optRow['31']);
-  const vol = +optRow['7762'] || 0;
-  const oi = optionMeta.oi ?? 0;
-  const bid = px(optRow['84']);
-  const ask = px(optRow['86']);
+  const last  = px(optRow['31']);
+  const bid   = px(optRow['84']);
+  const ask   = px(optRow['86']);
+  const vol   = +optRow['7762'] || 0;          // day volume (hi-precision)
+  const oi    = optionMeta.oi ?? 0;            // if you fetch OI separately, pass it in optionMeta
   const greeks = calcGreeks(optRow);
-  
-  if (oi != null) storeHistoricalData(optionMeta.conid, oi, vol);
-  const hist = getHistoricalAverages(optionMeta.conid);
-  
+
+  // Derived fields needed *before* stance:
   const size = vol;
   const premium = last * size * multiplier;
-  const aggressor = last >= ask ? true : (last <= bid ? false : (ask && bid ? (Math.abs(last-ask) < Math.abs(last-bid)) : true));
-  const volOiRatio = oi > 0 ? (vol/oi) : vol;
-  
+  const aggressor = last >= ask ? true
+                   : last <= bid ? false
+                   : (ask && bid ? (Math.abs(last - ask) < Math.abs(last - bid)) : true);
+  const volOiRatio = oi > 0 ? (vol / oi) : vol;
+
+  // Historical context
+  if (oi != null) storeHistoricalData(optionMeta.conid, oi, vol);
+  const hist = getHistoricalAverages(optionMeta.conid);
+
+  // Normalize option type
+  const type = optionMeta.right === 'C' ? 'CALL' : 'PUT';
+
+  // Core trade object (used by classifiers)
   const trade = {
     symbol: optionMeta.symbol,
     assetClass: isFuture ? 'FUTURES_OPTION' : 'EQUITY_OPTION',
     conid: optionMeta.conid,
-    type: optionMeta.right === 'C' ? 'CALL' : 'PUT',
+    type, // 'CALL' | 'PUT'
     strike: optionMeta.strike,
     expiry: optionMeta.expiry,
     optionPrice: last,
@@ -685,18 +916,43 @@ function buildTradePayload({ optionMeta, isFuture, ulConid, ul, optRow, multipli
     greeks,
     volOiRatio
   };
-  
-  const direction = classifyTradeUWStyle(trade, oi, vol, hist);
+
+  // Classifications
+  const direction  = classifyTradeUWStyle(trade, oi, vol, hist);
   const confidence = confidenceScore(trade, oi, vol, hist);
-  const tags = classifySizeTags(trade, isFuture);
-  
+  const tags       = classifySizeTags(trade, isFuture);
+
+  // Extra stance inputs (moneyness, DTE)
+  const mny = (optionMeta.strike && ul.price) ? (optionMeta.strike / ul.price) : null;
+  const dteDays = optionMeta.expiry
+    ? Math.ceil((parseYYYYMMDD(String(optionMeta.expiry)) - new Date())/86400000)
+    : null;
+
+  // Bull/Bear stance
+  const { score: stanceScore, label: stanceLabel, reasons: stanceReasons } = stanceForOptionPrint({
+    right: type,
+    aggressor,
+    direction,
+    delta: greeks?.delta ?? null,
+    moneyness: mny,
+    dte: dteDays,
+    volOiRatio,
+    size,
+    premium
+  });
+
   return {
     payload: {
-      type:'TRADE',
+      type: 'TRADE',
       ...trade,
       direction,
       confidence,
       classifications: tags,
+      stanceScore,          // e.g., -48
+      stanceLabel,          // 'BULL' | 'BEAR' | 'NEUTRAL'
+      stanceReasons,        // ['SELL-agg CALL','prem≥100k','vol/OI≥3x', ...]
+      dte: dteDays,
+      moneyness: mny,
       historicalComparison: {
         avgOI: Math.round(hist.avgOI),
         avgVolume: Math.round(hist.avgVolume),
@@ -704,7 +960,9 @@ function buildTradePayload({ optionMeta, isFuture, ulConid, ul, optRow, multipli
         volumeMultiple: hist.avgVolume>0 ? +(vol/hist.avgVolume).toFixed(2) : null,
         dataPoints: hist.dataPoints
       },
-      marketSession: isFuture ? (isFuturesMarketOpen() ? 'OPEN' : 'CLOSED') : (isEquityMarketOpen() ? 'REGULAR/EXTENDED' : 'CLOSED')
+      marketSession: isFuture
+        ? (isFuturesMarketOpen() ? 'OPEN' : 'CLOSED')
+        : (isEquityMarketOpen() ? 'REGULAR/EXTENDED' : 'CLOSED')
     },
     optRow
   };
