@@ -226,9 +226,24 @@ function confidenceScore(trade, oi, vol, hist){
   if (hist.dataPoints>=5) c+=10;
   return Math.min(100,c);
 }
-
+// Send mapping updates when new conids are discovered
+function broadcastConidMapping(conid, mapping) {
+  broadcastAll({
+    type: 'CONID_MAPPING',
+    conid,
+    mapping
+  });
+}
 /* --------------------------- Broadcast --------------------------------- */
-function broadcastAll(o){ const s = JSON.stringify(o); for (const ws of clients) if (ws.readyState===WebSocket.OPEN) ws.send(s); }
+// function broadcastAll(o){ const s = JSON.stringify(o); for (const ws of clients) if (ws.readyState===WebSocket.OPEN) ws.send(s); }
+function broadcastAll(o){ 
+  const s = JSON.stringify(o); 
+  for (const ws of clients) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(s);
+    }
+  }
+}
 
 function broadcastLiveOption(conid, row){
   const msg = {
@@ -294,48 +309,6 @@ function pickContractsAroundATM({ contracts, underlyingPx, targetCount=25 }){
   return out;
 }
 
-/* ------------------------ PRINTS emitter ------------------------------- */
-// function maybeEmitPrint(optionMeta, row, isFuture, multiplier){
-//   const conid = optionMeta.conid;
-//   const last  = px(row['31']);
-//   // const vol   = +row['87'] || 0;
-//   // const oi    = +row['84'] || 0; // map if your OI field differs
-
-//   const lastSize = +row['88'] || 0;     // ✅ size of the last trade
-//   const dayVol   = +row['7762'] || 0;   // ✅ day cumulative volume (optional)
-//   const oi       = optionMeta.oi ?? null; // see OI note below  
-//   // if (!vol) return;
-//   if (!lastSize) return;
-//   // const prevV = prevVol.get(conid) || 0;
-//   // const tradeSize = vol - prevV;
-//   // prevVol.set(conid, vol);
-
-//   // If you want to dedupe prints, track lastSize timestamps instead of dayVol deltas.
-//   const tradeSize = lastSize;  // treat each "last" tick as its own print
-
-//   if (tradeSize > 0 && last > 0) {
-//     const bid = px(row['84']), ask = px(row['86']);
-//     const aggressor = last >= ask ? true : (last <= bid ? false : (ask && bid ? (Math.abs(last-ask) < Math.abs(last-bid)) : true));
-//     const volOiRatio = oi > 0 ? vol / oi : vol;
-//     const premium = tradeSize * last * multiplier;
-
-//     broadcastAll({
-//       type:'PRINT',
-//       conid,
-//       symbol: optionMeta.symbol,
-//       right: optionMeta.right === 'C' ? 'CALL' : 'PUT',
-//       strike: optionMeta.strike,
-//       expiry: optionMeta.expiry,
-//       tradePrice: last,
-//       tradeSize,
-//       bid, ask,
-//       aggressor,
-//       premium,
-//       volOiRatio,
-//       timestamp: Date.now()
-//     });
-//   }
-// }
 function maybeEmitPrint(optionMeta, row, isFuture, multiplier) {
   const conid = optionMeta.conid;
   const last = px(row['31']);
@@ -398,124 +371,6 @@ async function getFrontFuture(symbol){
   return list?.[0];
 }
 
-// async function buildFuturesOptionSelection(symbol, underlyingPx){
-//   const meta = FUTURES_SYMBOLS[symbol];
-//   const fut  = await getFrontFuture(symbol);
-//   if (!fut) return { ulConid:null, options:[] };
-
-//   // get a concrete month from /trsrv/futures
-//   let month;
-//   try {
-//     const root = symbol.replace('/','').toUpperCase();
-//     const monthsData = await ibGet('/trsrv/futures', { symbols: root });
-//     month = pickMonthFromTrsrv(root, monthsData);
-//   } catch (e) {
-//     month = null;
-//   }
-//   if (!month) {
-//     const dt = new Date(); const y=dt.getUTCFullYear(); const m=String(dt.getUTCMonth()+2).padStart(2,'0');
-//     month = `${y}${m}`;
-//   }
-
-//   let info = [];
-//   try {
-//     // info = await ibGet('/iserver/secdef/info', { conid: fut.conid, sectype:'FOP', month, exchange: meta.exchange });
-//     // Try with exchange; if empty, retry without exchange
-//     info = await ibGet('/iserver/secdef/info', { conid: fut.conid, sectype:'FOP', month, exchange: meta.exchange });
-//     if (!Array.isArray(info) || info.length === 0) {
-//       info = await ibGet('/iserver/secdef/info', { conid: fut.conid, sectype:'FOP', month });
-//     }    
-//   } catch (e) {
-//     console.error('[FOP INFO]', symbol, e.response?.status, e.response?.data || e.message);
-//   }
-//   const raw = Array.isArray(info) ? info : [];
-//   const norm = raw.map(x => ({
-//     conid: x.conid,
-//     right: x.right === 'C' ? 'C' : 'P',
-//     strike: +x.strike || 0,
-//     expiry: x.lastTradingDay || x.maturityDate || '',
-//     exchange: meta.exchange,
-//     symbol
-//   }));
-
-//   // const coarse = norm.filter(c => c.strike > 0 && Math.abs((c.strike - underlyingPx)/Math.max(1,underlyingPx)) < 0.15);
-//   // const picked = pickContractsAroundATM({ contracts: (coarse.length?coarse:norm), underlyingPx, targetCount:25 });
-//   const coarse = norm.filter(c => c.strike > 0);
-//   const near   = coarse.filter(c => Math.abs((c.strike - underlyingPx)/Math.max(1,underlyingPx)) < 0.20);
-//   const base   = near.length >= 12 ? near : coarse;
-//   const picked = pickContractsAroundATM({ contracts: base, underlyingPx, targetCount:25 });  
-
-//   return { ulConid: fut.conid, options: picked };
-// }
-// async function getFrontFutureMonth(symbol) {
-//   const cleanSymbol = symbol.replace('/', '');
-//   try {
-//     // Try multiple approaches to get front month
-//     const approaches = [
-//       // Approach 1: Use /trsrv/futures
-//       async () => {
-//         const data = await ibGet('/trsrv/futures', { symbols: cleanSymbol });
-//         const contracts = data?.[cleanSymbol] || [];
-//         if (contracts.length > 0) {
-//           const front = contracts[0];
-//           const expDate = String(front.expirationDate || front.lastTradingDate || '');
-//           return expDate.slice(0, 6); // YYYYMM
-//         }
-//         return null;
-//       },
-//       // Approach 2: Use secdef/search and find nearest expiry
-//       async () => {
-//         const contracts = await secdefSearch(cleanSymbol, 'FUT');
-//         if (contracts && contracts.length > 0) {
-//           // Sort by expiry and take the front month
-//           const sorted = contracts
-//             .filter(c => c.lastTradingDay || c.maturityDate)
-//             .sort((a, b) => {
-//               const aDate = parseYYYYMMDD(a.lastTradingDay || a.maturityDate);
-//               const bDate = parseYYYYMMDD(b.lastTradingDay || b.maturityDate);
-//               return aDate - bDate;
-//             });
-//           if (sorted.length > 0) {
-//             const front = sorted[0];
-//             const expDate = front.lastTradingDay || front.maturityDate;
-//             return String(expDate).slice(0, 6); // YYYYMM
-//           }
-//         }
-//         return null;
-//       },
-//       // Approach 3: Generate current front month
-//       async () => {
-//         const now = new Date();
-//         let year = now.getUTCFullYear();
-//         let month = now.getUTCMonth() + 1;
-        
-//         // Futures typically roll to next month before expiry
-//         if (month === 12) {
-//           year++;
-//           month = 1;
-//         } else {
-//           month++;
-//         }
-//         return `${year}${String(month).padStart(2, '0')}`;
-//       }
-//     ];
-
-//     for (const approach of approaches) {
-//       try {
-//         const result = await approach();
-//         if (result) {
-//           console.log(`[FUT MONTH] ${symbol}: ${result}`);
-//           return result;
-//         }
-//       } catch (e) {
-//         // Try next approach
-//       }
-//     }
-//   } catch (e) {
-//     console.error(`[FUT MONTH] ${symbol} error:`, e.message);
-//   }
-//   return null;
-// }
 async function getFrontFutureMonth(symbol) {
   const cleanSymbol = symbol.replace('/', '');
   try {
@@ -568,62 +423,6 @@ async function getFuturesOptionsChain(futuresConid, exchange) {
   }
 }
 
-// async function buildFuturesOptionSelection(symbol, underlyingPx) {
-//   const meta = FUTURES_SYMBOLS[symbol];
-//   const fut = await getFrontFuture(symbol);
-//   if (!fut) return { ulConid: null, options: [] };
-
-//   // Get the front month futures contract directly
-//   let frontMonth = await getFrontFutureMonth(symbol);
-//   if (!frontMonth) {
-//     console.log(`[FUT] No front month found for ${symbol}, using search fallback`);
-//     return { ulConid: fut.conid, options: [] };
-//   }
-
-//   // Use secdef/search for futures options instead of secdef/info
-//   const fopSymbol = `${symbol.replace('/', '')}${frontMonth}`;
-//   console.log(`[FUT] Searching FOP: ${fopSymbol}`);
-  
-//   let fopContracts = [];
-//   try {
-//     fopContracts = await secdefSearch(fopSymbol, 'FOP');
-//   } catch (e) {
-//     console.error(`[FOP SEARCH] ${symbol}:`, e.message);
-//   }
-
-//   // If search fails, try getting options chain from the futures contract
-//   if (!fopContracts || fopContracts.length === 0) {
-//     try {
-//       fopContracts = await getFuturesOptionsChain(fut.conid, meta.exchange);
-//     } catch (e) {
-//       console.error(`[FOP CHAIN] ${symbol}:`, e.message);
-//     }
-//   }
-
-//   const norm = (Array.isArray(fopContracts) ? fopContracts : []).map(x => ({
-//     conid: x.conid,
-//     right: (x.right === 'C' || /CALL/i.test(x.description || '') || /C\b/.test(x.localSymbol || '')) ? 'C' : 'P',
-//     strike: +x.strike || 0,
-//     expiry: x.lastTradingDay || x.maturityDate || x.expirationDate || '',
-//     exchange: x.exchange || meta.exchange,
-//     symbol
-//   })).filter(x => x.conid && x.strike > 0);
-
-//   console.log(`[FUT] Found ${norm.length} FOP contracts for ${symbol}`);
-
-//   const coarse = norm.filter(c => {
-//     const strikePct = Math.abs((c.strike - underlyingPx) / Math.max(1, underlyingPx));
-//     return strikePct < 0.15; // Within 15% of underlying
-//   });
-
-//   const picked = pickContractsAroundATM({
-//     contracts: coarse.length ? coarse : norm,
-//     underlyingPx,
-//     targetCount: 25
-//   });
-
-//   return { ulConid: fut.conid, options: picked };
-// }
 /* === helper: choose a YYYYMM for equities from the 'months' string === */
 function pickEquityYYYYMMFromMonthsString(monthsStr, { targetDte = 15 } = {}) {
   if (!monthsStr) return null; // fallback handled by caller
@@ -651,78 +450,66 @@ function pickEquityYYYYMMFromMonthsString(monthsStr, { targetDte = 15 } = {}) {
   candidates.sort((a,b)=>a.delta-b.delta);
   return candidates[0].yyyymm;
 }
-// async function buildFuturesOptionSelection(symbol, underlyingPx) {
-//   const meta = FUTURES_SYMBOLS[symbol];
-//   const fut = await getFrontFuture(symbol);
-//   if (!fut) return { ulConid: null, options: [] };
+/* --------------------------- Dynamic Conid Mapping ------------------------- */
+const dynamicConidMap = new Map(); // conid -> {symbol, strike, right, expiry, discoveredAt}
 
-//   // Get proper futures month code
-//   const monthCode = await getFrontFutureMonth(symbol);
-//   const fopSymbol = `${symbol.replace('/', '')}${monthCode}`;
+// Track underlying mappings separately
+const ulConidMap = new Map(); // ulConid -> symbol
+
+// Update the mapping functions to broadcast
+function updateConidMapping(conid, symbol, strike, right, expiry) {
+  const mapping = {
+    symbol,
+    strike,
+    right,
+    expiry,
+    discoveredAt: Date.now(),
+    lastSeen: Date.now()
+  };
+  dynamicConidMap.set(conid, mapping);
+  broadcastConidMapping(conid, mapping);
+}
+
+function updateULMapping(ulConid, symbol) {
+  const mapping = {
+    symbol,
+    type: 'UNDERLYING',
+    discoveredAt: Date.now(),
+    lastSeen: Date.now()
+  };
+  ulConidMap.set(ulConid, mapping);
+  broadcastConidMapping(ulConid, mapping);
+}
+
+function getSymbolFromConid(conid) {
+  const mapping = dynamicConidMap.get(conid) || ulConidMap.get(conid);
+  return mapping ? mapping.symbol : 'UNKNOWN';
+}
+
+function getOptionDetails(conid) {
+  const mapping = dynamicConidMap.get(conid);
+  if (mapping) {
+    return {
+      symbol: mapping.symbol,
+      strike: mapping.strike,
+      right: mapping.right,
+      expiry: mapping.expiry,
+      description: `${mapping.symbol} ${mapping.strike}${mapping.right}`
+    };
+  }
   
-//   console.log(`[FUT] Searching FOP: ${fopSymbol} for underlying ${underlyingPx}`);
+  const ulMapping = ulConidMap.get(conid);
+  if (ulMapping) {
+    return {
+      symbol: ulMapping.symbol,
+      type: 'UNDERLYING',
+      description: `${ulMapping.symbol} Underlying`
+    };
+  }
+  
+  return { symbol: 'UNKNOWN', strike: 0, right: 'U', description: 'Unknown' };
+}
 
-//   let fopContracts = [];
-//   try {
-//     // Try direct FOP search first
-//     fopContracts = await secdefSearch(fopSymbol, 'FOP');
-//     console.log(`[FUT] Direct FOP search found: ${fopContracts?.length || 0} contracts`);
-//   } catch (e) {
-//     console.error(`[FOP SEARCH] ${symbol}:`, e.message);
-//   }
-
-//   // If no contracts found, try alternative approaches
-//   if (!fopContracts || fopContracts.length === 0) {
-//     try {
-//       // Try without month code
-//       fopContracts = await secdefSearch(symbol.replace('/', ''), 'FOP');
-//       console.log(`[FUT] Generic FOP search found: ${fopContracts?.length || 0} contracts`);
-//     } catch (e) {
-//       console.error(`[FOP GENERIC] ${symbol}:`, e.message);
-//     }
-//   }
-
-//   const norm = (Array.isArray(fopContracts) ? fopContracts : []).map(x => {
-//     let strike = 0;
-//     if (x.strike) {
-//       strike = +x.strike;
-//     } else if (x.description) {
-//       const strikeMatch = x.description.match(/\s(\d+(?:\.\d+)?)\s/);
-//       if (strikeMatch) strike = +strikeMatch[1];
-//     }
-    
-//     return {
-//       conid: x.conid,
-//       right: (x.right === 'C' || /CALL/i.test(x.description || '') || /C\b/.test(x.localSymbol || '')) ? 'C' : 'P',
-//       strike: strike,
-//       expiry: x.lastTradingDay || x.maturityDate || x.expirationDate || '',
-//       exchange: x.exchange || meta.exchange,
-//       symbol
-//     };
-//   }).filter(x => x.conid && x.strike > 0);
-
-//   console.log(`[FUT] Normalized ${norm.length} FOP contracts for ${symbol}`);
-
-//   if (norm.length === 0) {
-//     console.log(`[FUT] No valid FOP contracts found for ${symbol}, trying manual conid discovery...`);
-//     // You might need to manually add some conids here for testing
-//     return { ulConid: fut.conid, options: [] };
-//   }
-
-//   const coarse = norm.filter(c => {
-//     const strikePct = Math.abs((c.strike - underlyingPx) / Math.max(1, underlyingPx));
-//     return strikePct < 0.15; // Within 15% of underlying
-//   });
-
-//   const picked = pickContractsAroundATM({
-//     contracts: coarse.length ? coarse : norm,
-//     underlyingPx,
-//     targetCount: 25
-//   });
-
-//   console.log(`[FUT] Selected ${picked.length} FOP contracts for ${symbol}`);
-//   return { ulConid: fut.conid, options: picked };
-// }
 async function buildFuturesOptionSelection(symbol, underlyingPx){
   const meta = FUTURES_SYMBOLS[symbol];
   const fut  = await getFrontFuture(symbol);
@@ -819,56 +606,6 @@ app.get('/debug/contracts/:symbol', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
-/* === FIXED: equities === */
-// async function buildEquityOptionSelection(symbol, underlyingPx){
-//   const stkConid = await findStockConid(symbol);
-//   if (!stkConid) return { ulConid:null, options:[] };
-
-//   // 1) discover available months (returns "NOV25;DEC25;...")
-//   const search = await secdefSearch(symbol, 'OPT');
-//   const monthsStr = search?.[0]?.sections?.find(s => s.secType === 'OPT')?.months || '';
-//   // 2) pick a reasonable YYYYMM near ~15DTE; fallback to current YYYYMM
-//   let month = pickEquityYYYYMMFromMonthsString(monthsStr) || (() => {
-//     const d = new Date(); return `${d.getUTCFullYear()}${String(d.getUTCMonth()+1).padStart(2,'0')}`;
-//   })();
-
-//   // 3) fetch the actual chain for that month
-//   let info = [];
-//   try {
-//     info = await ibGet('/iserver/secdef/info', { conid: stkConid, sectype: 'OPT', month, exchange: 'SMART' });
-//     if (!Array.isArray(info) || info.length === 0) {
-//       // retry without exchange, then plus one month
-//       info = await ibGet('/iserver/secdef/info', { conid: stkConid, sectype: 'OPT', month });
-//       if (!Array.isArray(info) || info.length === 0) {
-//         const y = +month.slice(0,4), m = +month.slice(4,6);
-//         const dt = new Date(Date.UTC(y, m-1, 1)); dt.setUTCMonth(dt.getUTCMonth()+1);
-//         month = `${dt.getUTCFullYear()}${String(dt.getUTCMonth()+1).padStart(2,'0')}`;
-//         info = await ibGet('/iserver/secdef/info', { conid: stkConid, sectype: 'OPT', month, exchange: 'SMART' });
-//       }
-//     }
-//   } catch (e) {
-//     console.error('[EQ INFO]', symbol, e.response?.status, e.response?.data || e.message);
-//   }
-
-//   const raw = Array.isArray(info) ? info : [];
-//   // normalize → keep only shaped fields we need
-//   const norm = raw.map(x => ({
-//     conid:  x.conid,
-//     right:  x.right === 'C' ? 'C' : 'P',
-//     strike: +x.strike || 0,
-//     expiry: x.maturityDate || x.lastTradingDay || '',
-//     exchange: 'SMART',
-//     symbol
-//   }));
-
-//   // pick near-ATM
-//   const coarse = norm.filter(c => c.strike > 0);
-//   const near   = coarse.filter(c => Math.abs((c.strike - underlyingPx)/Math.max(1,underlyingPx)) < 0.20);
-//   const base   = near.length >= 12 ? near : coarse;
-//   const picked = pickContractsAroundATM({ contracts: base, underlyingPx, targetCount: 25 });
-
-//   return { ulConid: stkConid, options: picked };
-// }
 async function buildEquityOptionSelection(symbol, underlyingPx) {
   const stkConid = await findStockConid(symbol);
   if (!stkConid) return { ulConid: null, options: [] };
@@ -936,75 +673,25 @@ async function buildEquityOptionSelection(symbol, underlyingPx) {
   console.log(`[EQ] Selected ${picked.length} options for ${symbol}`);
   return { ulConid: stkConid, options: picked };
 }
-// async function buildEquityOptionSelection(symbol, underlyingPx){
-//   const stkConid = await findStockConid(symbol);
-//   if (!stkConid) return { ulConid:null, options:[] };
-
-//   const raw = await secdefSearch(symbol, 'OPT');
-//   const norm = (Array.isArray(raw) ? raw : []).map(x => ({
-//     conid: x.conid,
-//     right: /C\b/.test(x.description||x.localSymbol||'') ? 'C' : 'P',
-//     strike: +x.strike || 0,
-//     expiry: x.maturityDate || '',
-//     exchange: x.exchange || 'SMART',
-//     symbol
-//   }));
-//   const forExpiry = chooseExpiryNear15DTE(norm, { target:15, window:10 });
-//   const picked = pickContractsAroundATM({ contracts: (forExpiry.length?forExpiry:norm), underlyingPx, targetCount:25 });
-//   return { ulConid: stkConid, options: picked };
-// }
-// async function buildEquityOptionSelection(symbol, underlyingPx) {
-//   const stkConid = await findStockConid(symbol);
-//   if (!stkConid) return { ulConid: null, options: [] };
-
-//   const raw = await secdefSearch(symbol, 'OPT');
-//   const norm = (Array.isArray(raw) ? raw : []).map(x => {
-//     // Extract strike price properly - IBKR often has it in description or localSymbol
-//     let strike = 0;
-//     if (x.strike) {
-//       strike = +x.strike;
-//     } else if (x.description) {
-//       // Try to extract from description like "AAPL Jan 17 2025 200 Call"
-//       const strikeMatch = x.description.match(/\s(\d+(?:\.\d+)?)\s(?:Call|Put)/i);
-//       if (strikeMatch) strike = +strikeMatch[1];
-//     } else if (x.localSymbol) {
-//       // Try to extract from localSymbol like "AAPL  250119C00200000"
-//       const strikeMatch = x.localSymbol.match(/\d{6}[CP](\d{8})/);
-//       if (strikeMatch) strike = +strikeMatch[1] / 1000;
-//     }
-    
-//     return {
-//       conid: x.conid,
-//       right: /C\b/.test(x.description || x.localSymbol || '') ? 'C' : 'P',
-//       strike: strike,
-//       expiry: x.maturityDate || '',
-//       exchange: x.exchange || 'SMART',
-//       symbol
-//     };
-//   }).filter(x => x.conid && x.strike > 0); // Only include valid strikes
-
-//   console.log(`[EQ] Found ${norm.length} options for ${symbol}, strikes:`, norm.slice(0, 5).map(x => x.strike));
-
-//   const forExpiry = chooseExpiryNear15DTE(norm, { target: 15, window: 10 });
-//   const picked = pickContractsAroundATM({ 
-//     contracts: forExpiry.length ? forExpiry : norm, 
-//     underlyingPx, 
-//     targetCount: 25 
-//   });
-
-//   console.log(`[EQ] Picked ${picked.length} options for ${symbol}`);
-//   return { ulConid: stkConid, options: picked };
-// }
-
-/* -------------------------- Core process ------------------------------- */
-async function captureUnderlying(ulConid){
+async function captureUnderlying(ulConid) {
   const snap = await mdSnapshot([ulConid]);
-  const row  = snap?.[0] || {};
-  const ulPx = px(row['31']);
+  const row = snap?.[0] || {};
+  
+  // Try to auto-discover UL symbol if not mapped
+  if (!ulConidMap.has(ulConid)) {
+    // Try to infer from known futures
+    for (const [symbol, meta] of Object.entries(FUTURES_SYMBOLS)) {
+      const fut = await getFrontFuture(symbol);
+      if (fut && fut.conid === ulConid) {
+        updateULMapping(ulConid, symbol);
+        break;
+      }
+    }
+  }
+  
   broadcastLiveUL(ulConid, row);
-  return { price: ulPx, row };
+  return { price: px(row['31']), row };
 }
-
 // function buildTradePayload({ optionMeta, isFuture, ulConid, ul, optRow, multiplier }){
 function buildTradePayload({ optionMeta, isFuture, ulConid, ul, optRow, multiplier }){  
   const last = px(optRow['31']);
@@ -1076,24 +763,6 @@ function buildTradePayload({ optionMeta, isFuture, ulConid, ul, optRow, multipli
   };
 }
 
-// async function processOptionConid(optionMeta, isFuture, ulConid, multiplier){
-//   const [optSnap, ul] = await Promise.all([ mdSnapshot([optionMeta.conid]), captureUnderlying(ulConid) ]);
-//   const optRow = optSnap?.[0];
-//   if (!optRow) return;
-
-//   optionToUL.set(optionMeta.conid, ulConid);
-//   // ulForOption.set(optionMeta.conid, { isFuture, mult: multiplier, symbol: optionMeta.symbol });
-//   ulForOption.set(optionMeta.conid, {
-//     isFuture, mult: multiplier, symbol: optionMeta.symbol,
-//     right: optionMeta.right, strike: optionMeta.strike, expiry: optionMeta.expiry,
-//     oi: optionMeta.oi ?? null
-//   });  
-
-//   const { payload, optRow: rowForPrint } = buildTradePayload({ optionMeta, isFuture, ulConid, ul, optRow, multiplier });
-//   if (payload.premium >= 1000) broadcastAll(payload); // guard against spammy micro prints
-//   maybeEmitPrint(optionMeta, rowForPrint, isFuture, multiplier);
-//   broadcastLiveOption(optionMeta.conid, optRow);
-// }
 async function processOptionConid(optionMeta, isFuture, ulConid, multiplier) {
   try {
     const [optSnap, ul] = await Promise.all([
@@ -1102,10 +771,18 @@ async function processOptionConid(optionMeta, isFuture, ulConid, multiplier) {
     ]);
     
     const optRow = optSnap?.[0];
-    if (!optRow) {
-      console.log(`[OPTION] No data for conid ${optionMeta.conid}`);
-      return;
-    }
+    if (!optRow) return;
+
+    // 🚀 AUTO-DISCOVER: Update mappings
+    updateConidMapping(
+      optionMeta.conid,
+      optionMeta.symbol,
+      optionMeta.strike,
+      optionMeta.right,
+      optionMeta.expiry
+    );
+    
+    updateULMapping(ulConid, optionMeta.symbol);
 
     optionToUL.set(optionMeta.conid, ulConid);
     ulForOption.set(optionMeta.conid, {
@@ -1123,7 +800,6 @@ async function processOptionConid(optionMeta, isFuture, ulConid, multiplier) {
       multiplier
     });
 
-    // Only broadcast if we have valid data
     if (payload && payload.premium >= 1000) {
       broadcastAll(payload);
     }
@@ -1133,65 +809,9 @@ async function processOptionConid(optionMeta, isFuture, ulConid, multiplier) {
 
   } catch (error) {
     console.error(`[PROCESS OPTION] ${optionMeta.symbol} ${optionMeta.conid} error:`, error.message);
-    // Don't rethrow - continue processing other options
   }
 }
-/* -------------------------- Loops ------------------------------------- */
-// async function loopFuturesSymbol(symbol){
-//   try{
-//     const fut = await getFrontFuture(symbol);
-//     if (!fut) return;
 
-//     const ulSnap = await mdSnapshot([fut.conid]);
-//     const ulRow  = ulSnap?.[0] || {};
-//     const ulPx   = px(ulRow['31']);
-//     broadcastLiveUL(fut.conid, ulRow);
-
-//     if (!ulPx || ulPx < 0) return; // permissions/delayed → skip pass
-
-//     const { ulConid, options } = await buildFuturesOptionSelection(symbol, ulPx);
-//     for (const meta of options) {
-//       await processOptionConid(meta, true, ulConid, FUTURES_SYMBOLS[symbol].multiplier);
-//       await sleep(120);
-//     }
-//   } catch(e) {
-//     console.error('[FUT LOOP]', symbol, e.response?.data || e.message);
-//   }
-// }
-// async function loopFuturesSymbol(symbol) {
-//   try {
-//     console.log(`[FUT LOOP] Starting ${symbol}`);
-//     const fut = await getFrontFuture(symbol);
-//     if (!fut) {
-//       console.log(`[FUT LOOP] No futures contract found for ${symbol}`);
-//       return;
-//     }
-
-//     console.log(`[FUT LOOP] ${symbol} conid: ${fut.conid}`);
-
-//     const ulSnap = await mdSnapshot([fut.conid]);
-//     const ulRow = ulSnap?.[0] || {};
-//     const ulPx = px(ulRow['31']);
-    
-//     console.log(`[FUT LOOP] ${symbol} UL price: ${ulPx}`);
-//     broadcastLiveUL(fut.conid, ulRow);
-
-//     if (!ulPx || ulPx < 0) {
-//       console.log(`[FUT LOOP] ${symbol} no valid price, skipping`);
-//       return;
-//     }
-
-//     const { ulConid, options } = await buildFuturesOptionSelection(symbol, ulPx);
-//     console.log(`[FUT LOOP] ${symbol} found ${options.length} options`);
-
-//     for (const meta of options) {
-//       await processOptionConid(meta, true, ulConid, FUTURES_SYMBOLS[symbol].multiplier);
-//       await sleep(120);
-//     }
-//   } catch (e) {
-//     console.error(`[FUT LOOP] ${symbol} error:`, e.response?.data || e.message);
-//   }
-// }
 async function loopFuturesSymbol(symbol) {
   try {
     console.log(`[FUT LOOP] Starting ${symbol}`);
@@ -1282,19 +902,127 @@ async function pollLiveQuotes(){
     }
   } catch(e) {}
 }
+// Clean up old mappings (expired contracts)
+function cleanupOldMappings() {
+  const now = Date.now();
+  const thirtyDaysAgo = now - (30 * 24 * 60 * 60 * 1000);
+  
+  let cleaned = 0;
+  for (const [conid, mapping] of dynamicConidMap.entries()) {
+    if (mapping.lastSeen < thirtyDaysAgo) {
+      dynamicConidMap.delete(conid);
+      cleaned++;
+    }
+  }
+  
+  if (cleaned > 0) {
+    console.log(`[MAPPING] Cleaned up ${cleaned} old conid mappings`);
+  }
+}
 
+// Run cleanup every hour
+setInterval(cleanupOldMappings, 60 * 60 * 1000);
+app.get('/debug/conid-mapping', (req, res) => {
+  const mappings = {};
+  
+  dynamicConidMap.forEach((value, key) => {
+    mappings[key] = {
+      ...value,
+      discoveredAgo: Math.round((Date.now() - value.discoveredAt) / 1000) + 's ago'
+    };
+  });
+  
+  const ulMappings = {};
+  ulConidMap.forEach((value, key) => {
+    ulMappings[key] = {
+      ...value,
+      discoveredAgo: Math.round((Date.now() - value.discoveredAt) / 1000) + 's ago'
+    };
+  });
+  
+  res.json({
+    option_mappings: mappings,
+    underlying_mappings: ulMappings,
+    stats: {
+      total_options: dynamicConidMap.size,
+      total_underlyings: ulConidMap.size,
+      last_cleanup: new Date().toISOString()
+    }
+  });
+});
+
+app.get('/debug/auto-discover', async (req, res) => {
+  try {
+    console.log('[MAPPING] Starting auto-discovery for all symbols...');
+    
+    for (const symbol of ['/ES', '/NQ']) {
+      try {
+        const fut = await getFrontFuture(symbol);
+        if (fut) {
+          updateULMapping(fut.conid, symbol);
+          
+          const ulSnap = await mdSnapshot([fut.conid]);
+          const ulPx = px(ulSnap?.[0]?.['31']);
+          
+          if (ulPx) {
+            const { options } = await buildFuturesOptionSelection(symbol, ulPx);
+            options.forEach(opt => {
+              updateConidMapping(opt.conid, symbol, opt.strike, opt.right, opt.expiry);
+            });
+            console.log(`[MAPPING] Discovered ${options.length} options for ${symbol}`);
+          }
+        }
+      } catch (e) {
+        console.log(`[MAPPING] Failed for ${symbol}:`, e.message);
+      }
+    }
+    
+    res.json({ 
+      message: 'Auto-discovery completed',
+      discovered: {
+        options: dynamicConidMap.size,
+        underlyings: ulConidMap.size
+      }
+    });
+    
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+// After server starts, run initial discovery
+setTimeout(async () => {
+  console.log('[MAPPING] Running initial conid discovery...');
+  try {
+    // This will automatically populate mappings as options are processed
+    console.log('[MAPPING] Mappings will be populated during normal processing');
+  } catch (e) {
+    console.error('[MAPPING] Initial discovery failed:', e.message);
+  }
+}, 5000);
 /* ------------------------- WS + UI ------------------------------------ */
 const DEFAULT_SUBS = { futures:['/ES','/NQ'], equities:['SPY','QQQ'] };
 
 wss.on('connection', (ws)=>{
   clients.add(ws);
   ws._subs = { ...DEFAULT_SUBS };
+  
+  // 🚀 Send initial conid mappings
+  const initialMappings = {};
+  dynamicConidMap.forEach((value, key) => {
+    initialMappings[key] = value;
+  });
+  ulConidMap.forEach((value, key) => {
+    initialMappings[key] = value;
+  });
+  
   ws.send(JSON.stringify({
     type:'connected',
     message:'Connected to IBKR Flow (auto 25 ATM, ~15 DTE) with live quotes, prints & BTO/STO/BTC/STC',
     availableFutures: Object.keys(FUTURES_SYMBOLS),
-    availableEquities: EQUITY_SYMBOLS
+    availableEquities: EQUITY_SYMBOLS,
+    conidMappings: initialMappings // Send mappings
   }));
+  
   ws.on('message', (m)=>{
     try{
       const d = JSON.parse(m.toString());
@@ -1304,6 +1032,17 @@ wss.on('connection', (ws)=>{
           equities: Array.isArray(d.equitySymbols) ? d.equitySymbols : DEFAULT_SUBS.equities
         };
         ws.send(JSON.stringify({ type:'subscribed', futures: ws._subs.futures, equities: ws._subs.equities }));
+      }
+      else if (d.action === 'get_mappings') {
+        // Send current mappings
+        const currentMappings = {};
+        dynamicConidMap.forEach((value, key) => {
+          currentMappings[key] = value;
+        });
+        ulConidMap.forEach((value, key) => {
+          currentMappings[key] = value;
+        });
+        ws.send(JSON.stringify({ type: 'CONID_MAPPINGS', mappings: currentMappings }));
       }
     }catch(e){}
   });
@@ -1326,62 +1065,133 @@ body{font-family:monospace;background:#0a0a0a;color:#0f0;margin:0;padding:16px}
 .sto,.stc{color:#ffaa55;font-weight:bold}
 .q{font-size:12px;color:#9a9a9a}
 .print{font-size:12px;color:#0ff}
+.unknown{color:#ff5555}
 </style></head>
 <body>
-<h2>🚀 IBKR Flow (25x ATM, ~15DTE)</h2>
+<h2>🚀 IBKR Flow (Futures Only - /ES, /NQ)</h2>
 <div>WS: ws://localhost:${PORT}/ws</div>
 <hr/>
 <div id="out"></div>
 <script>
 const out = document.getElementById('out');
 const ws = new WebSocket('ws://'+location.host+'/ws');
-ws.onopen=()=>ws.send(JSON.stringify({action:'subscribe',futuresSymbols:['/ES','/NQ'],equitySymbols:['SPY','QQQ']}));
+
+// Dynamic conid mapping storage
+let conidMappings = {};
+
+ws.onopen = () => {
+  ws.send(JSON.stringify({action:'subscribe',futuresSymbols:['/ES','/NQ'],equitySymbols:[]}));
+  console.log('Connected to IBKR Flow');
+};
+
+// Dynamic conid mapping function
+function getOptionDetails(conid) {
+  return conidMappings[conid] || { symbol: 'UNKNOWN', strike: 0, right: 'U', description: 'Unknown' };
+}
+
 function rowTrade(d){
   const classes = (d.classifications||[]).map(x=>x.toLowerCase()).join(' ');
   const ac = d.assetClass==='FUTURES_OPTION'?'futures':'equity';
   const dir=(d.direction||'').toLowerCase();
   const hist=d.historicalComparison||{};
   const g=d.greeks||{delta:0};
-  return \`<div class="row \${classes} \${ac}" id="t-\${d.conid}">
-    <div><span class="\${dir}">\${d.direction}</span> \${d.confidence}% |
-      <b>\${d.symbol} \${d.type} $\${d.strike}</b> exp \${d.expiry||''} |
-      size \${d.size} OI \${d.openInterest} prem $\${(d.premium||0).toFixed(0)} |
-      vol/OI \${(d.volOiRatio??0).toFixed(2)}</div>
-    <div class="q" id="q-\${d.conid}">
-      UL $\${(d.underlyingPrice||0).toFixed(2)} | OPT $\${(d.optionPrice||0).toFixed(2)}
-      | bid $\${(d.bid||0).toFixed(2)} ask $\${(d.ask||0).toFixed(2)} | Δ \${(g.delta||0).toFixed(3)}
-    </div>
-    <div class="q">hist: avgOI \${hist.avgOI??'-'} | avgVol \${hist.avgVolume??'-'} | OIΔ \${hist.oiChange??'-'} | Vol× \${hist.volumeMultiple??'-'} | days \${hist.dataPoints??0}</div>
-  </div>\`;
+  
+  const details = getOptionDetails(d.conid);
+  const symbolDisplay = details.symbol === 'UNKNOWN' ? '<span class="unknown">conid '+d.conid+'</span>' : details.symbol;
+  const strikeDisplay = details.strike > 0 ? '$'+details.strike : '';
+  const rightDisplay = details.right !== 'U' ? details.right : '';
+  
+  return '<div class="row '+classes+' '+ac+'" id="t-'+d.conid+'">'+
+    '<div><span class="'+dir+'">'+d.direction+'</span> '+d.confidence+'% |'+
+      '<b> '+symbolDisplay+' '+rightDisplay+' '+strikeDisplay+'</b> '+(d.expiry||'')+' |'+
+      ' size '+d.size+' prem $'+(d.premium||0).toFixed(0)+' |'+
+      ' vol/OI '+((d.volOiRatio||0)).toFixed(2)+'</div>'+
+    '<div class="q" id="q-'+d.conid+'">'+
+      'UL $'+(d.underlyingPrice||0).toFixed(2)+' | OPT $'+(d.optionPrice||0).toFixed(2)+
+      ' | bid $'+(d.bid||0).toFixed(2)+' ask $'+(d.ask||0).toFixed(2)+' | Δ '+((g.delta||0)).toFixed(3)+
+    '</div>'+
+    '<div class="q">hist: avgOI '+(hist.avgOI||'-')+' | avgVol '+(hist.avgVolume||'-')+' | OIΔ '+(hist.oiChange||'-')+' | Vol× '+(hist.volumeMultiple||'-')+' | days '+(hist.dataPoints||0)+'</div>'+
+  '</div>';
 }
+
 function rowPrint(p){
-  return \`<div class="row print">
-    PRINT \${p.symbol} \${p.right} $\${p.strike} exp \${p.expiry||''} |
-    size \${p.tradeSize} @ $\${p.tradePrice.toFixed(2)} prem $\${p.premium.toFixed(0)} |
-    vol/OI \${(p.volOiRatio??0).toFixed(2)} | \${p.aggressor?'BUY-agg':'SELL-agg'}
-  </div>\`;
+  const details = getOptionDetails(p.conid);
+  const symbolDisplay = details.symbol === 'UNKNOWN' ? '<span class="unknown">conid '+p.conid+'</span>' : details.symbol;
+  const strikeDisplay = details.strike > 0 ? '$'+details.strike : '';
+  
+  return '<div class="row print">'+
+    'PRINT '+symbolDisplay+' '+p.right+' '+strikeDisplay+' '+(p.expiry||'')+' |'+
+    ' size '+p.tradeSize+' @ $'+p.tradePrice.toFixed(2)+' prem $'+p.premium.toFixed(0)+' |'+
+    ' vol/OI '+((p.volOiRatio||0)).toFixed(2)+' | '+(p.aggressor?'BUY-agg':'SELL-agg')+
+  '</div>';
 }
-function updateQuote(d){
-  const el=document.getElementById('q-'+d.conid);
+
+function updateQuote(d) {
+  const el = document.getElementById('q-'+d.conid);
   if(!el) return;
+  
+  const details = getOptionDetails(d.conid);
+  
   if(d.type==='LIVE_QUOTE'){
-    el.innerHTML=\`OPT $\${d.last.toFixed(2)} (bid $\${d.bid.toFixed(2)} ask $\${d.ask.toFixed(2)}) | Δ \${d.delta.toFixed(3)} | vol \${d.volume} | \${new Date(d.timestamp).toLocaleTimeString()}\`;
+    let displayText;
+    if (details.symbol === 'UNKNOWN') {
+      displayText = '<span class="unknown">conid '+d.conid+'</span> | OPT $'+d.last.toFixed(2)+' | Δ '+d.delta.toFixed(3);
+    } else {
+      const rightDisplay = details.right === 'C' ? 'CALL' : (details.right === 'P' ? 'PUT' : '');
+      displayText = details.symbol+' '+rightDisplay+' $'+details.strike+' | OPT $'+d.last.toFixed(2)+' | Δ '+d.delta.toFixed(3);
+    }
+    
+    el.innerHTML = displayText+' | vol '+d.volume+' | '+new Date(d.timestamp).toLocaleTimeString();
+    
+  } else if(d.type==='UL_LIVE_QUOTE') {
+    const ulDetails = getOptionDetails(d.conid);
+    let symbolDisplay;
+    if (ulDetails.symbol === 'UNKNOWN') {
+      symbolDisplay = '<span class="unknown">conid '+d.conid+'</span>';
+    } else {
+      symbolDisplay = ulDetails.symbol + (ulDetails.type === 'UNDERLYING' ? ' UL' : '');
+    }
+    
+    el.innerHTML = symbolDisplay+' | last $'+d.last.toFixed(2)+' | vol '+d.volume+' | '+new Date(d.timestamp).toLocaleTimeString();
   }
 }
+
 ws.onmessage=(e)=>{
   const d=JSON.parse(e.data);
-  if(d.type==='TRADE'){
-    const div=document.createElement('div'); div.innerHTML=rowTrade(d);
+  
+  if(d.type==='connected' && d.conidMappings){
+    // Store initial mappings from server
+    conidMappings = { ...conidMappings, ...d.conidMappings };
+    console.log('Loaded', Object.keys(d.conidMappings).length, 'conid mappings');
+  }
+  else if(d.type==='CONID_MAPPING'){
+    // Update mapping when new conid is discovered
+    conidMappings[d.conid] = d.mapping;
+    console.log('Updated mapping for conid', d.conid, '->', d.mapping.symbol);
+  }
+  else if(d.type==='TRADE'){
+    const div=document.createElement('div'); 
+    div.innerHTML=rowTrade(d);
     out.insertBefore(div.firstElementChild,out.firstChild);
     while(out.children.length>80) out.removeChild(out.lastChild);
-  }else if(d.type==='PRINT'){
-    const div=document.createElement('div'); div.innerHTML=rowPrint(d);
+  }
+  else if(d.type==='PRINT'){
+    const div=document.createElement('div'); 
+    div.innerHTML=rowPrint(d);
     out.insertBefore(div.firstElementChild,out.firstChild);
     while(out.children.length>80) out.removeChild(out.lastChild);
-  }else if(d.type==='LIVE_QUOTE' || d.type==='UL_LIVE_QUOTE'){
+  }
+  else if(d.type==='LIVE_QUOTE' || d.type==='UL_LIVE_QUOTE'){
     updateQuote(d);
   }
 };
+
+// Auto-refresh mappings every 30 seconds
+setInterval(() => {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({action: 'get_mappings'}));
+  }
+}, 30000);
 </script>
 </body></html>`);
 });
@@ -1408,7 +1218,7 @@ app.get('/health', (req,res)=>res.json({ ok:true, ts:Date.now() }));
       const eqs  = ['SPY','QQQ'];
 
       for (const f of futs) await loopFuturesSymbol(f);
-      for (const s of eqs)  await loopEquitySymbol(s);
+      // for (const s of eqs)  await loopEquitySymbol(s);
       await pollLiveQuotes();
       await sleep(1500);
     }
