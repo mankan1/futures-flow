@@ -73,6 +73,40 @@ const FUTURES_SYMBOLS = {
 
 const EQUITY_SYMBOLS = ['SPY','QQQ','AAPL','TSLA','NVDA','AMZN','MSFT','META','GOOGL'];
 
+/* --------------------------- AutoTrade Config ----------------------------- */
+/**
+ * Turn on with for example:
+ *   AUTOTRADE=1 AUTOTRADE_MODE=log   # log-only (default, safe)
+ *   AUTOTRADE=1 AUTOTRADE_MODE=live  # actually send orders to IBKR
+ */
+const AUTOTRADE = {
+  enabled: process.env.AUTOTRADE === '1',
+  mode: process.env.AUTOTRADE_MODE || 'log', // 'log' | 'live'
+
+  // What counts as a "serious" flow to include in clusters:
+  minFlowPremium: 50_000,         // per-print / per-trade premium
+  minFlowConfidence: 60,          // TRADE.confidence threshold
+
+  // Cluster requirements (per symbol, rolling short window):
+  minClusterCount: 3,             // at least N serious flows
+  minClusterPremium: 250_000,     // total notional across serious flows
+  minClusterStanceScore: 80,      // summed stanceScore for bull/bear side
+
+  // Trend gating:
+  minTrendMovePct: 0.001,         // 0.1% move between prev/last to count as trend
+
+  // Position / risk:
+  contractsPerTrade: 1,           // size
+  coolDownMs: 10 * 60 * 1000,     // 10 min per symbol/side
+  clusterStaleMs: 2 * 60 * 1000,  // ignore clusters older than this (2 min)
+
+  // Safety:
+  maxTradesPerSymbolPerSidePerDay: 5
+};
+
+/* Account id (optional). If omitted, we’ll try /iserver/accounts */
+let IB_ACCOUNT_ID = process.env.IBKR_ACCOUNT_ID || null;
+
 /* --------------------------- State ------------------------------------- */
 const historicalData = new Map(); // conid -> [{date, oi, volume, ts}]
 const liveQuotes = new Map(); // conid -> last quote cache
@@ -82,10 +116,31 @@ const ulForOption = new Map(); // option conid -> { isFuture, mult, symbol, righ
 const dynamicConidMap = new Map(); // conid -> {symbol, strike, right, expiry, discoveredAt}
 const ulConidMap = new Map(); // ulConid -> symbol
 
+/** Aggregated flow per underlying symbol */
+const flowAgg = new Map(); // symbol -> { bullScore, bearScore, bullPrem, bearPrem, bullCount, bearCount, lastTs }
+
+/** Price trend per underlying symbol */
+const ulTrend = new Map(); // symbol -> { last, prev, lastTs }
+
+/** When we last fired an auto trade per symbol+side */
+const lastAutoTradeTs = new Map(); // key `${symbol}:${side}` -> ts
+
+/** Count of trades per symbol+side per calendar day */
+const tradeCountPerDay = new Map(); // key `${day}:${symbol}:${side}` -> count
+
+/** Latest option selection per symbol (from your loops) */
+const latestOptionsBySymbol = new Map(); // symbol -> [optionMeta]
+/** Latest underlying price per symbol */
+const ulLastPriceBySymbol = new Map();   // symbol -> lastPx
+
 /* --------------------------- Utils ------------------------------------- */
 const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
 const nowISO = ()=>new Date().toISOString();
 const todayKey = ()=>new Date().toISOString().split('T')[0];
+
+function todayKeySimple() {
+  return new Date().toISOString().slice(0, 10);
+}
 
 function px(v){
   if (v == null) return 0;
@@ -150,7 +205,7 @@ async function primeIB() {
     try {
       const { data } = await ax.get('/iserver/auth/status');
       if (data?.authenticated && data?.connected) {
-        console.log('\\n\\n[IB] authenticated & connected\\n');
+        console.log('\n\n[IB] authenticated & connected\n');
         return;
       }
       console.log('[IB] status:', data);
@@ -242,7 +297,25 @@ function confidenceScore(trade, oi, vol, hist){
 }
 
 /* --------------------------- Broadcast --------------------------------- */
+
+function onServerEventForAutotrade(ev) {
+  if (!AUTOTRADE.enabled || !ev || typeof ev !== 'object') return;
+
+  if (ev.type === 'TRADE' || ev.type === 'PRINT') {
+    updateFlowAggFromEvent(ev);
+  } else if (ev.type === 'UL_LIVE_QUOTE') {
+    updateTrendFromULQuote(ev);
+  }
+}
+
 function broadcastAll(o){
+  // feed into autotrade brain
+  try {
+    onServerEventForAutotrade(o);
+  } catch (e) {
+    console.error('[AUTOTRADE hook error]', e.message);
+  }
+
   const s = JSON.stringify(o);
   for (const ws of clients) {
     if (ws.readyState === WebSocket.OPEN) {
@@ -343,7 +416,7 @@ function chooseExpiryNear15DTE(list, { target=15, window=10 }){
 function pickContractsAroundATM({ contracts, underlyingPx, targetCount=25 }){
   const calls=[], puts=[];
   for (const c of contracts) {
-    const isCall = c.right === 'C' || /C\\b/.test(c.right||'') || /C\\b/.test(c.localSymbol||'') || /C\\b/.test(c.description||'');
+    const isCall = c.right === 'C' || /\bC\b/.test(c.right||'') || /\bC\b/.test(c.localSymbol||'') || /\bC\b/.test(c.description||'');
     const strike = +c.strike || 0;
     const rec = { ...c, isCall, strike, dist: Math.abs(strike - underlyingPx) };
     (isCall ? calls : puts).push(rec);
@@ -378,10 +451,6 @@ function maybeEmitPrint(optionMeta, row, isFuture, multiplier) {
     const aggressor = last >= ask ? true : (last <= bid ? false : (ask && bid ? (Math.abs(last - ask) < Math.abs(last - bid)) : true));
     const volOiRatio = oi > 0 ? volume / oi : volume;
     const premium = tradeSize * last * multiplier;
-    // derive extra context for stance
-    const ulPx = null;  // if you have UL here pass it, else compute moneyness from known fields
-    let mny = null;
-    if (optionMeta.strike && ulPx) mny = optionMeta.strike / ulPx;
 
     // If you cached greeks on last snapshot:
     const delta = +row['7308'] || null;
@@ -393,14 +462,12 @@ function maybeEmitPrint(optionMeta, row, isFuture, multiplier) {
       if (expDate) dteDays = Math.ceil((expDate - new Date())/86400000);
     }
 
-    // Direction is unknown at print-time unless you pipe through your UW classifier.
-    // If you have it, pass it; otherwise leave undefined and the scorer still works.
     const stance = stanceForOptionPrint({
       right: optionMeta.right === 'C' ? 'CALL' : 'PUT',
       aggressor,
-      direction: undefined,        // or your inferred 'BTO'|'STO'|'BTC'|'STC'
+      direction: undefined,
       delta,
-      moneyness: mny,
+      moneyness: null,
       dte: dteDays,
       volOiRatio,
       size: tradeSize,
@@ -422,26 +489,10 @@ function maybeEmitPrint(optionMeta, row, isFuture, multiplier) {
       premium,
       volOiRatio,
       timestamp: Date.now(),
-      stance: stance.label,        // <-- NEW
-      stanceScore: stance.score,   // <-- NEW
-      stanceNotes: stance.notes    // <-- NEW (array of strings)
-    });    
-    // broadcastAll({
-    //   type: 'PRINT',
-    //   conid,
-    //   symbol: optionMeta.symbol,
-    //   right: optionMeta.right === 'C' ? 'CALL' : 'PUT',
-    //   strike: optionMeta.strike,
-    //   expiry: optionMeta.expiry,
-    //   tradePrice: last,
-    //   tradeSize,
-    //   bid,
-    //   ask,
-    //   aggressor,
-    //   premium,
-    //   volOiRatio,
-    //   timestamp: Date.now()
-    // });
+      stance: stance.label,
+      stanceScore: stance.score,
+      stanceNotes: stance.reasons
+    });
   }
 }
 
@@ -645,6 +696,7 @@ async function buildEquityOptionSelection(symbol, underlyingPx) {
     return { ulConid: stkConid, options: [] };
   }
 }
+
 /* === helper: choose a YYYYMM for equities from the 'months' string === */
 function pickEquityYYYYMMFromMonthsString(monthsStr, { targetDte = 15 } = {}) {
   if (!monthsStr) return null;
@@ -692,20 +744,17 @@ async function captureUnderlying(ulConid) {
   broadcastLiveUL(ulConid, row);
   return { price: px(row['31']), row };
 }
+
 /* ===================== Bull/Bear Stance ===================== */
 /**
  * Returns a stance score in [-100, +100] and a label "BULL"/"BEAR"/"NEUTRAL".
- * Factors:
- *  - Aggressor + Right (BUY-agg CALL ~ bull, BUY-agg PUT ~ bear, etc.)
- *  - Direction (BTO/STO/BTC/STC) nudges score toward/away from open interest creation
- *  - Premium size, vol/OI spike, short-dated DTE, delta magnitude, moneyness
  */
 function stanceForOptionPrint({
   right,            // 'CALL' | 'PUT'
   aggressor,        // boolean (true=BUY-agg, false=SELL-agg)
   direction,        // 'BTO'|'STO'|'BTC'|'STC'
   delta,            // number | null
-  moneyness,        // strike / underlyingPrice  (≈1 = ATM, >1 call OTM / put ITM)
+  moneyness,        // strike / underlyingPrice
   dte,              // integer days to expiry
   volOiRatio,       // number (>=0)
   size,             // contracts
@@ -714,7 +763,6 @@ function stanceForOptionPrint({
   const reasons = [];
 
   // 1) Base from aggressor × right
-  // BUY-agg CALL = +35, SELL-agg CALL = -35, BUY-agg PUT = -35, SELL-agg PUT = +35
   let base = 0;
   if (right === 'CALL') {
     base = aggressor ? +35 : -35;
@@ -724,18 +772,17 @@ function stanceForOptionPrint({
     reasons.push(`${aggressor ? 'BUY' : 'SELL'}-agg PUT`);
   }
 
-  // 2) Direction nudge (opening trades sway more than closing)
-  // BTO/STO influence 10 pts, BTC/STC 5 pts (weak).
+  // 2) Direction nudge
   const dirMap = { BTO: +10, STO: -10, BTC: +5, STC: -5 };
   const dirNudge = dirMap[direction] ?? 0;
   base += dirNudge;
   if (dirNudge) reasons.push(`dir:${direction}`);
 
-  // 3) Premium magnitude (institutional heft)
+  // 3) Premium magnitude
   if (premium >= 1_000_000) { base *= 1.20; reasons.push('prem≥1M'); }
   else if (premium >= 100_000) { base *= 1.10; reasons.push('prem≥100k'); }
 
-  // 4) Volume/OI spike (unusualness)
+  // 4) Volume/OI spike
   if (volOiRatio != null) {
     if (volOiRatio >= 5) { base *= 1.35; reasons.push('vol/OI≥5x'); }
     else if (volOiRatio >= 3) { base *= 1.25; reasons.push('vol/OI≥3x'); }
@@ -748,18 +795,16 @@ function stanceForOptionPrint({
     else if (dte <= 7) { base *= 1.15; reasons.push('DTE≤7'); }
   }
 
-  // 6) Delta magnitude: closer to 0.5 strengthens stance (ATM conviction)
+  // 6) Delta magnitude
   if (Number.isFinite(delta)) {
     const mag = Math.min(Math.abs(delta), 1);
-    // Emphasize |delta| in [0.3,0.7]
-    const weight = 0.9 + 0.3 * Math.exp(-Math.pow((mag - 0.5)/0.2, 2)); // ~[0.9,1.2]
+    const weight = 0.9 + 0.3 * Math.exp(-Math.pow((mag - 0.5)/0.2, 2));
     base *= weight;
     reasons.push(`|Δ|≈${mag.toFixed(2)}`);
   }
 
-  // 7) Moneyness sanity: very far OTM softens stance a bit
+  // 7) Moneyness sanity: far OTM softens stance
   if (Number.isFinite(moneyness) && moneyness > 0) {
-    // For calls: mny >> 1 means far OTM -> reduce; for puts: mny << 1 means far OTM -> reduce
     const farOTMCall = right === 'CALL' && moneyness >= 1.15;
     const farOTMPut  = right === 'PUT'  && moneyness <= 0.85;
     if (farOTMCall || farOTMPut) {
@@ -768,11 +813,10 @@ function stanceForOptionPrint({
     }
   }
 
-  // 8) Size nudge (secondary to premium)
+  // 8) Size nudge
   if (size >= 500) { base *= 1.10; reasons.push('size≥500'); }
   else if (size >= 100) { base *= 1.05; reasons.push('size≥100'); }
 
-  // Clamp and label
   const score = Math.max(-100, Math.min(100, Math.round(base)));
   const label = score > 30 ? 'BULL' : score < -30 ? 'BEAR' : 'NEUTRAL';
 
@@ -784,11 +828,10 @@ function buildTradePayload({ optionMeta, isFuture, ulConid, ul, optRow, multipli
   const last  = px(optRow['31']);
   const bid   = px(optRow['84']);
   const ask   = px(optRow['86']);
-  const vol   = +optRow['7762'] || 0;          // day volume (hi-precision)
-  const oi    = optionMeta.oi ?? 0;            // if you fetch OI separately, pass it in optionMeta
+  const vol   = +optRow['7762'] || 0;
+  const oi    = optionMeta.oi ?? 0;
   const greeks = calcGreeks(optRow);
 
-  // Derived fields needed *before* stance:
   const size = vol;
   const premium = last * size * multiplier;
   const aggressor = last >= ask ? true
@@ -796,19 +839,16 @@ function buildTradePayload({ optionMeta, isFuture, ulConid, ul, optRow, multipli
                    : (ask && bid ? (Math.abs(last - ask) < Math.abs(last - bid)) : true);
   const volOiRatio = oi > 0 ? (vol / oi) : vol;
 
-  // Historical context
   if (oi != null) storeHistoricalData(optionMeta.conid, oi, vol);
   const hist = getHistoricalAverages(optionMeta.conid);
 
-  // Normalize option type
   const type = optionMeta.right === 'C' ? 'CALL' : 'PUT';
 
-  // Core trade object (used by classifiers)
   const trade = {
     symbol: optionMeta.symbol,
     assetClass: isFuture ? 'FUTURES_OPTION' : 'EQUITY_OPTION',
     conid: optionMeta.conid,
-    type, // 'CALL' | 'PUT'
+    type,
     strike: optionMeta.strike,
     expiry: optionMeta.expiry,
     optionPrice: last,
@@ -827,18 +867,15 @@ function buildTradePayload({ optionMeta, isFuture, ulConid, ul, optRow, multipli
     volOiRatio
   };
 
-  // Classifications
   const direction  = classifyTradeUWStyle(trade, oi, vol, hist);
   const confidence = confidenceScore(trade, oi, vol, hist);
   const tags       = classifySizeTags(trade, isFuture);
 
-  // Extra stance inputs (moneyness, DTE)
   const mny = (optionMeta.strike && ul.price) ? (optionMeta.strike / ul.price) : null;
   const dteDays = optionMeta.expiry
     ? Math.ceil((parseYYYYMMDD(String(optionMeta.expiry)) - new Date())/86400000)
     : null;
 
-  // Bull/Bear stance
   const { score: stanceScore, label: stanceLabel, reasons: stanceReasons } = stanceForOptionPrint({
     right: type,
     aggressor,
@@ -858,9 +895,9 @@ function buildTradePayload({ optionMeta, isFuture, ulConid, ul, optRow, multipli
       direction,
       confidence,
       classifications: tags,
-      stanceScore,          // e.g., -48
-      stanceLabel,          // 'BULL' | 'BEAR' | 'NEUTRAL'
-      stanceReasons,        // ['SELL-agg CALL','prem≥100k','vol/OI≥3x', ...]
+      stanceScore,
+      stanceLabel,
+      stanceReasons,
       dte: dteDays,
       moneyness: mny,
       historicalComparison: {
@@ -939,8 +976,14 @@ async function loopFuturesSymbol(symbol) {
     broadcastLiveUL(fut.conid, ulRow);
     
     if (!ulPx || ulPx < 0) return;
+
+    // cache UL price for autotrade
+    ulLastPriceBySymbol.set(symbol, ulPx);
     
     const { ulConid, options } = await buildFuturesOptionSelection(symbol, ulPx);
+
+    // cache options universe
+    latestOptionsBySymbol.set(symbol, options);
     
     for (const meta of options) {
       try {
@@ -966,10 +1009,16 @@ async function loopEquitySymbol(symbol){
     broadcastLiveUL(stkConid, ulRow);
     
     if (!ulPx || ulPx < 0) return;
+
+    // cache UL price for autotrade
+    ulLastPriceBySymbol.set(symbol, ulPx);
     
     const { ulConid, options } = await buildEquityOptionSelection(symbol, ulPx);
     
     console.log(`[EQ LOOP] ${symbol} processing ${options.length} options`);
+
+    // cache options universe
+    latestOptionsBySymbol.set(symbol, options);
     
     for (const meta of options) {
       try {
@@ -984,17 +1033,53 @@ async function loopEquitySymbol(symbol){
   }
 }
 
-async function pollLiveQuotes(){
-  try{
+// async function pollLiveQuotes(){
+//   try{
+//     const optionConids = Array.from(optionToUL.keys());
+//     if (!optionConids.length) return;
+    
+//     const snaps = await mdSnapshot(optionConids);
+//     for (let i=0;i<snaps.length;i++){
+//       const row = snaps[i] || {};
+//       const conid = row.conid || optionConids[i];
+//       broadcastLiveOption(conid, row);
+      
+//       const meta = ulForOption.get(conid);
+//       if (meta) {
+//         const optionMeta = {
+//           conid,
+//           symbol: meta.symbol,
+//           right: meta.right,
+//           strike: meta.strike,
+//           expiry: meta.expiry,
+//           oi: meta.oi ?? null
+//         };
+//         maybeEmitPrint(optionMeta, row, meta.isFuture, meta.mult);
+//       }
+      
+//       const ulConid = optionToUL.get(conid);
+//       if (ulConid) {
+//         const ulSnap = await mdSnapshot([ulConid]);
+//         broadcastLiveUL(ulConid, ulSnap?.[0] || {});
+//       }
+//       await sleep(25);
+//     }
+//   } catch(e) {}
+// }
+async function pollLiveQuotes() {
+  try {
     const optionConids = Array.from(optionToUL.keys());
     if (!optionConids.length) return;
-    
+
     const snaps = await mdSnapshot(optionConids);
-    for (let i=0;i<snaps.length;i++){
+    for (let i = 0; i < snaps.length; i++) {
       const row = snaps[i] || {};
       const conid = row.conid || optionConids[i];
+
+      // 1) Broadcast live option quote as before
       broadcastLiveOption(conid, row);
-      
+
+      // 2) Existing PRINT logic
       const meta = ulForOption.get(conid);
       if (meta) {
         const optionMeta = {
@@ -1007,17 +1092,44 @@ async function pollLiveQuotes(){
         };
         maybeEmitPrint(optionMeta, row, meta.isFuture, meta.mult);
       }
-      
+
+      // 3) Existing UL snapshot per option (you can optimize later if needed)
       const ulConid = optionToUL.get(conid);
       if (ulConid) {
         const ulSnap = await mdSnapshot([ulConid]);
         broadcastLiveUL(ulConid, ulSnap?.[0] || {});
       }
+
+      // 4) NEW: update synthetic AUTOTRADE PnL based on current mid
+      if (typeof midFromSnapshotRow === 'function' && AUTOTRADE_BOOK) {
+        const mid = midFromSnapshotRow(row); // uses bid/ask or last
+        if (mid != null) {
+          for (const [id, rec] of AUTOTRADE_BOOK.entries()) {
+            if (rec.conid !== conid) continue;
+
+            const sideSign = rec.side === 'BUY' ? 1 : -1;
+            const pnl = (mid - rec.entryPrice) * rec.qty * rec.multiplier * sideSign;
+
+            rec.markPrice = mid;
+            rec.unrealizedPnl = pnl;
+
+            AUTOTRADE_BOOK.set(id, rec);
+
+            // Broadcast update so UI can refresh fill/mark/PnL
+            broadcastAll({
+              type: 'AUTOTRADE_UPDATE',
+              ...rec
+            });
+          }
+        }
+      }
+
       await sleep(25);
     }
-  } catch(e) {}
+  } catch (e) {
+    console.error('[pollLiveQuotes]', e.message || e);
+  }
 }
-
 function cleanupOldMappings() {
   const now = Date.now();
   const thirtyDaysAgo = now - (30 * 24 * 60 * 60 * 1000);
@@ -1036,6 +1148,408 @@ function cleanupOldMappings() {
 }
 
 setInterval(cleanupOldMappings, 60 * 60 * 1000);
+
+/* ------------------------- AutoTrade Helpers ----------------------------- */
+
+function isSeriousFlow(ev) {
+  const prem = ev.premium || 0;
+  const conf = ev.confidence || 0;
+  const classes = ev.classifications || [];
+  if (prem >= AUTOTRADE.minFlowPremium) return true;
+  if (conf >= AUTOTRADE.minFlowConfidence) return true;
+  if (classes.includes('SWEEP') || classes.includes('BLOCK')) return true;
+  return false;
+}
+
+function updateFlowAggFromEvent(ev) {
+  const label = ev.stanceLabel || ev.stance;
+  if (label !== 'BULL' && label !== 'BEAR') return;
+  if (!isSeriousFlow(ev)) return;
+
+  const sym = ev.symbol || (dynamicConidMap.get(ev.conid)?.symbol);
+  if (!sym) return;
+
+  const now = Date.now();
+  const score = typeof ev.stanceScore === 'number'
+    ? Math.abs(ev.stanceScore)
+    : 40;
+  const prem = ev.premium || 0;
+
+  let node = flowAgg.get(sym);
+  if (!node) {
+    node = {
+      bullScore: 0, bearScore: 0,
+      bullPrem: 0,  bearPrem: 0,
+      bullCount: 0, bearCount: 0,
+      lastTs: 0
+    };
+  }
+
+  if (label === 'BULL') {
+    node.bullScore += score;
+    node.bullPrem  += prem;
+    node.bullCount++;
+  } else {
+    node.bearScore += score;
+    node.bearPrem  += prem;
+    node.bearCount++;
+  }
+  node.lastTs = now;
+
+  flowAgg.set(sym, node);
+}
+
+function updateTrendFromULQuote(ev) {
+  const mapping = ulConidMap.get(ev.conid);
+  if (!mapping || !mapping.symbol) return;
+  const sym = mapping.symbol;
+  const last = ev.last;
+  if (!last || last <= 0) return;
+
+  const now = ev.timestamp || Date.now();
+  const prevRec = ulTrend.get(sym) || {};
+  const prevLast = prevRec.last || last;
+
+  ulTrend.set(sym, {
+    prev: prevLast,
+    last,
+    lastTs: now
+  });
+}
+
+function trendBiasForSymbol(sym) {
+  const t = ulTrend.get(sym);
+  if (!t || !t.prev || !t.last || t.prev <= 0) return 'FLAT';
+  const changePct = (t.last - t.prev) / t.prev;
+  if (changePct >= AUTOTRADE.minTrendMovePct) return 'UP';
+  if (changePct <= -AUTOTRADE.minTrendMovePct) return 'DOWN';
+  return 'FLAT';
+}
+
+function canFireSide(symbol, side) {
+  const now = Date.now();
+  const key = `${symbol}:${side}`;
+
+  const lastTs = lastAutoTradeTs.get(key) || 0;
+  if (now - lastTs < AUTOTRADE.coolDownMs) return false;
+
+  const dayKey = `${todayKeySimple()}:${symbol}:${side}`;
+  const count = tradeCountPerDay.get(dayKey) || 0;
+  if (count >= AUTOTRADE.maxTradesPerSymbolPerSidePerDay) return false;
+
+  return true;
+}
+
+function markTradeFired(symbol, side) {
+  const now = Date.now();
+  const key = `${symbol}:${side}`;
+  lastAutoTradeTs.set(key, now);
+
+  const dayKey = `${todayKeySimple()}:${symbol}:${side}`;
+  const prev = tradeCountPerDay.get(dayKey) || 0;
+  tradeCountPerDay.set(dayKey, prev + 1);
+}
+
+/**
+ * Core decision engine: scan flowAgg and maybe place trades.
+ */
+async function evaluateAutotrade() {
+  if (!AUTOTRADE.enabled) return;
+
+  const now = Date.now();
+
+  for (const [symbol, agg] of flowAgg.entries()) {
+    if (now - agg.lastTs > AUTOTRADE.clusterStaleMs) continue;
+
+    const trend = trendBiasForSymbol(symbol);
+
+    const bullOK =
+      agg.bullCount >= AUTOTRADE.minClusterCount &&
+      agg.bullPrem  >= AUTOTRADE.minClusterPremium &&
+      agg.bullScore >= AUTOTRADE.minClusterStanceScore &&
+      agg.bullScore >= agg.bearScore * 1.3;
+
+    const bearOK =
+      agg.bearCount >= AUTOTRADE.minClusterCount &&
+      agg.bearPrem  >= AUTOTRADE.minClusterPremium &&
+      agg.bearScore >= AUTOTRADE.minClusterStanceScore &&
+      agg.bearScore >= agg.bullScore * 1.3;
+
+    const wantBull = bullOK && trend === 'UP';
+    const wantBear = bearOK && trend === 'DOWN';
+
+    if (!wantBull && !wantBear) continue;
+
+    if (wantBull && canFireSide(symbol, 'BULL')) {
+      console.log('[AUTOTRADE] Bullish cluster detected for', symbol, { agg, trend });
+      await maybePlaceAutoOptionTrade(symbol, 'BULL');
+    } else if (wantBear && canFireSide(symbol, 'BEAR')) {
+      console.log('[AUTOTRADE] Bearish cluster detected for', symbol, { agg, trend });
+      await maybePlaceAutoOptionTrade(symbol, 'BEAR');
+    }
+  }
+}
+
+// /**
+//  * Pick a near-ATM call/put from latestOptionsBySymbol and send (or log) an order.
+//  * Also broadcasts a simulated trade event for the UI.
+//  */
+// async function maybePlaceAutoOptionTrade(symbol, bias /* 'BULL'|'BEAR' */) {
+//   const options = latestOptionsBySymbol.get(symbol) || [];
+//   const ulPx = ulLastPriceBySymbol.get(symbol) || null;
+//   if (!options.length || !ulPx) {
+//     console.log('[AUTOTRADE] No option universe or UL price for', symbol);
+//     return;
+//   }
+
+//   const desiredRight = bias === 'BULL' ? 'C' : 'P';
+//   const candidates = options
+//     .filter(o => (o.right || '').toUpperCase().startsWith(desiredRight) && o.strike > 0);
+
+//   if (!candidates.length) {
+//     console.log('[AUTOTRADE] No', desiredRight, 'candidates for', symbol);
+//     return;
+//   }
+
+//   candidates.sort((a, b) =>
+//     Math.abs(a.strike - ulPx) - Math.abs(b.strike - ulPx)
+//   );
+//   const pick = candidates[0];
+
+//   const isFuture = !!FUTURES_SYMBOLS[symbol];
+//   const side = 'BUY';
+
+//   console.log('[AUTOTRADE] Selected contract', {
+//     symbol,
+//     bias,
+//     conid: pick.conid,
+//     right: pick.right,
+//     strike: pick.strike,
+//     expiry: pick.expiry,
+//     ulPx
+//   });
+
+//   // Broadcast a simulated trade for the UI to pick up.
+//   const simPayload = {
+//     type: 'AUTOTRADE_SIM',
+//     symbol,
+//     bias,
+//     side,
+//     conid: pick.conid,
+//     right: pick.right === 'C' ? 'CALL' : 'PUT',
+//     strike: pick.strike,
+//     expiry: pick.expiry,
+//     ulPrice: ulPx,
+//     qty: AUTOTRADE.contractsPerTrade,
+//     isFuture,
+//     mode: AUTOTRADE.mode,
+//     timestamp: Date.now()
+//   };
+//   broadcastAll(simPayload);
+
+//   if (AUTOTRADE.mode !== 'live') {
+//     console.log('[AUTOTRADE] DRY RUN (mode!=live): would send order', {
+//       side,
+//       qty: AUTOTRADE.contractsPerTrade
+//     });
+//     markTradeFired(symbol, bias);
+//     return;
+//   }
+
+//   try {
+//     await placeIbSingleOptionOrder({
+//       conid: pick.conid,
+//       side,
+//       quantity: AUTOTRADE.contractsPerTrade,
+//       isFuture
+//     });
+//     console.log('[AUTOTRADE] LIVE order sent for', symbol, bias, 'conid', pick.conid);
+//     markTradeFired(symbol, bias);
+//   } catch (e) {
+//     console.error('[AUTOTRADE] Failed to send order:', e.response?.data || e.message);
+//   }
+// }
+/**
+ * Pick a near-ATM call/put from latestOptionsBySymbol and send (or log) an order.
+ * Also records a synthetic fill at mid and broadcasts a simulated trade for the UI.
+ */
+async function maybePlaceAutoOptionTrade(symbol, bias /* 'BULL'|'BEAR' */) {
+  const options = latestOptionsBySymbol.get(symbol) || [];
+  const ulPx = ulLastPriceBySymbol.get(symbol) || null;
+
+  if (!options.length || !ulPx) {
+    console.log('[AUTOTRADE] No option universe or UL price for', symbol);
+    return;
+  }
+
+  const desiredRight = bias === 'BULL' ? 'C' : 'P';
+  const candidates = options
+    .filter(o => (o.right || '').toUpperCase().startsWith(desiredRight) && o.strike > 0);
+
+  if (!candidates.length) {
+    console.log('[AUTOTRADE] No', desiredRight, 'candidates for', symbol);
+    return;
+  }
+
+  // Pick the strike closest to UL
+  candidates.sort((a, b) =>
+    Math.abs(a.strike - ulPx) - Math.abs(b.strike - ulPx)
+  );
+  const pick = candidates[0];
+
+  const isFuture = !!FUTURES_SYMBOLS[symbol];
+  const side = 'BUY'; // you can later make this conditional if you want
+
+  console.log('[AUTOTRADE] Selected contract', {
+    symbol,
+    bias,
+    conid: pick.conid,
+    right: pick.right,
+    strike: pick.strike,
+    expiry: pick.expiry,
+    ulPx
+  });
+
+  // --- NEW: snapshot the option to get mid for synthetic fill ---
+  let entryPrice = null;
+  try {
+    const snaps = await mdSnapshot([pick.conid]); // you already have mdSnapshot()
+    const row = snaps?.[0] || {};
+    const mid = midFromSnapshotRow(row);
+    if (mid != null) entryPrice = mid;
+  } catch (e) {
+    console.error('[AUTOTRADE] mid snapshot failed for', pick.conid, e.message);
+  }
+
+  if (entryPrice == null) {
+    console.log('[AUTOTRADE] No usable mid/last price for', pick.conid, '- skipping auto trade');
+    return;
+  }
+
+  const multiplier = isFuture ? (FUTURES_SYMBOLS[symbol]?.multiplier || 50) : 100;
+
+  // You can either keep fixed contractsPerTrade, or compute from notional.
+  // Here we keep your existing contractsPerTrade:
+  const qty = AUTOTRADE.contractsPerTrade || 1;
+
+  const id = makeAutoId(symbol, pick);
+  const ts = Date.now();
+
+  const record = {
+    id,
+    symbol,
+    bias,
+    side,
+    conid: pick.conid,
+    right: pick.right === 'C' ? 'CALL' : 'PUT',
+    strike: pick.strike,
+    expiry: pick.expiry,
+    ulPrice: ulPx,
+    qty,
+    isFuture,
+    mode: AUTOTRADE.mode,   // 'sim' | 'live'
+    entryPrice,             // synthetic fill at mid
+    markPrice: entryPrice,  // start mark = entry
+    unrealizedPnl: 0,
+    multiplier,
+    timestamp: ts,
+    entryTs: ts
+  };
+
+  // Store in synthetic book so you can update PnL later in quote loop
+  AUTOTRADE_BOOK.set(id, record);
+
+  // Broadcast a simulated trade (now including fill + PnL fields) for the UI.
+  const simPayload = {
+    type: 'AUTOTRADE_SIM',
+    ...record
+  };
+  broadcastAll(simPayload);
+
+  if (AUTOTRADE.mode !== 'live') {
+    console.log('[AUTOTRADE] DRY RUN (mode!=live): would send order', {
+      side,
+      qty
+    });
+    markTradeFired(symbol, bias);
+    return;
+  }
+
+  // LIVE: actually send order to IBKR
+  try {
+    await placeIbSingleOptionOrder({
+      conid: pick.conid,
+      side,
+      quantity: qty,
+      isFuture
+    });
+    console.log('[AUTOTRADE] LIVE order sent for', symbol, bias, 'conid', pick.conid);
+    markTradeFired(symbol, bias);
+  } catch (e) {
+    console.error('[AUTOTRADE] Failed to send order:', e.response?.data || e.message);
+  }
+}
+/* ---------------------- IB Order Helpers -------------------------- */
+// Synthetic autotrade book (simulated fills)
+const AUTOTRADE_BOOK = new Map(); // tradeId -> record
+function makeAutoId(symbol, pick) {
+  // You can tweak this however you like
+  return `${symbol}:${pick.right}:${pick.strike}:${pick.expiry}:${Date.now()}`;
+}
+
+function midFromSnapshotRow(row) {
+  if (!row) return null;
+  const bid = px(row['84']);
+  const ask = px(row['86']);
+  if (bid > 0 && ask > 0) return (bid + ask) / 2;
+  const last = px(row['31']);
+  return last > 0 ? last : null;
+}
+
+function midFromRow(row) {
+  const bid = px(row['84']);
+  const ask = px(row['86']);
+  if (bid > 0 && ask > 0) return (bid + ask) / 2;
+  const last = px(row['31']);
+  return last > 0 ? last : null;
+}
+
+async function ensureIbAccountId() {
+  if (IB_ACCOUNT_ID) return IB_ACCOUNT_ID;
+  try {
+    const data = await ibGet('/iserver/accounts');
+    const acct = data?.accounts?.[0] || data?.[0];
+    if (!acct) throw new Error('No accounts in /iserver/accounts response');
+    IB_ACCOUNT_ID = acct.accountId || acct.id || acct;
+    console.log('[IB] Using accountId', IB_ACCOUNT_ID);
+    return IB_ACCOUNT_ID;
+  } catch (e) {
+    console.error('[IB] Failed to resolve account id:', e.response?.data || e.message);
+    throw e;
+  }
+}
+
+async function placeIbSingleOptionOrder({ conid, side, quantity, isFuture }) {
+  const accountId = await ensureIbAccountId();
+
+  const secType = isFuture ? 'FOP' : 'OPT';
+
+  const order = {
+    conid,
+    secType,
+    orderType: 'MKT',
+    side,
+    tif: 'DAY',
+    quantity,
+    outsideRTH: false
+  };
+
+  const body = { orders: [order] };
+
+  const path = `/iserver/account/${accountId}/order`;
+  const { data } = await ax.post(path, body);
+  return data;
+}
 
 /* ------------------------- HTTP Routes -------------------------------- */
 app.get('/health', (req,res)=>res.json({ ok:true, ts:Date.now() }));
@@ -1077,7 +1591,6 @@ app.get('/debug/equity-options/:symbol', async (req, res) => {
       return res.json({ error: 'Stock not found', symbol });
     }
     
-    // Get underlying price
     const ulSnap = await mdSnapshot([stkConid]);
     const ulPx = px(ulSnap?.[0]?.['31']);
     
@@ -1088,7 +1601,6 @@ app.get('/debug/equity-options/:symbol', async (req, res) => {
       methods: {}
     };
     
-    // Try Method 1: secdef/strikes
     try {
       const strikes = await ibGet('/iserver/secdef/strikes', {
         conid: stkConid,
@@ -1100,7 +1612,6 @@ app.get('/debug/equity-options/:symbol', async (req, res) => {
       results.methods.strikes = { error: e.message };
     }
     
-    // Try Method 2: secdef/info
     try {
       const info = await ibGet('/iserver/secdef/info', {
         conid: stkConid,
@@ -1115,7 +1626,6 @@ app.get('/debug/equity-options/:symbol', async (req, res) => {
       results.methods.info = { error: e.message };
     }
     
-    // Try Method 3: secdef/search
     try {
       const search = await secdefSearch(symbol, 'OPT');
       results.methods.search = {
@@ -1234,6 +1744,7 @@ body{font-family:monospace;background:#0a0a0a;color:#0f0;margin:0;padding:16px}
 .q{font-size:12px;color:#9a9a9a}
 .print{font-size:12px;color:#0ff}
 .unknown{color:#ff5555}
+.autotrade-sim{border-color:#00aaff;background:#00101a}
 </style></head>
 <body>
 <h2>🚀 IBKR Flow (Equities + Futures)</h2>
@@ -1275,17 +1786,17 @@ function rowTrade(d){
   const symbolDisplay = details.symbol === 'UNKNOWN' 
     ? '<span class="unknown">conid '+d.conid+'</span>' 
     : details.symbol;
-  const strikeDisplay = details.strike > 0 ? '+details.strike : '';
+  const strikeDisplay = details.strike > 0 ? details.strike : '';
   const rightDisplay = details.right !== 'U' ? details.right : '';
   
   return '<div class="row '+classes+' '+ac+'" id="t-'+d.conid+'">'+
-    '<div><span class="'+dir+'">'+d.direction+'</span> '+d.confidence+'% |'+
+    '<div><span class="'+dir+'">'+(d.direction||'')+'</span> '+(d.confidence||0)+'% |'+
     '<b> '+symbolDisplay+' '+rightDisplay+' '+strikeDisplay+'</b> '+(d.expiry||'')+' |'+
-    ' size '+d.size+' prem +(d.premium||0).toFixed(0)+' |'+
+    ' size '+(d.size||0)+' prem '+(d.premium||0).toFixed(0)+' |'+
     ' vol/OI '+((d.volOiRatio||0)).toFixed(2)+'</div>'+
     '<div class="q" id="q-'+d.conid+'">'+
-    'UL +(d.underlyingPrice||0).toFixed(2)+' | OPT +(d.optionPrice||0).toFixed(2)+
-    ' | bid +(d.bid||0).toFixed(2)+' ask +(d.ask||0).toFixed(2)+' | Δ '+((g.delta||0)).toFixed(3)+
+    'UL '+(d.underlyingPrice||0).toFixed(2)+' | OPT '+(d.optionPrice||0).toFixed(2)+
+    ' | bid '+(d.bid||0).toFixed(2)+' ask '+(d.ask||0).toFixed(2)+' | Δ '+((g.delta||0)).toFixed(3)+
     '</div>'+
     '<div class="q">hist: avgOI '+(hist.avgOI||'-')+' | avgVol '+(hist.avgVolume||'-')+
     ' | OIΔ '+(hist.oiChange||'-')+' | Vol× '+(hist.volumeMultiple||'-')+' | days '+(hist.dataPoints||0)+'</div>'+
@@ -1297,12 +1808,22 @@ function rowPrint(p){
   const symbolDisplay = details.symbol === 'UNKNOWN' 
     ? '<span class="unknown">conid '+p.conid+'</span>' 
     : details.symbol;
-  const strikeDisplay = details.strike > 0 ? '+details.strike : '';
+  const strikeDisplay = details.strike > 0 ? details.strike : '';
   
   return '<div class="row print">'+
-    'PRINT '+symbolDisplay+' '+p.right+' '+strikeDisplay+' '+(p.expiry||'')+' |'+
-    ' size '+p.tradeSize+' @ +p.tradePrice.toFixed(2)+' prem +p.premium.toFixed(0)+' |'+
+    'PRINT '+symbolDisplay+' '+(p.right||'')+' '+strikeDisplay+' '+(p.expiry||'')+' |'+
+    ' size '+(p.tradeSize||0)+' @ '+(p.tradePrice||0).toFixed(2)+' prem '+(p.premium||0).toFixed(0)+' |'+
     ' vol/OI '+((p.volOiRatio||0)).toFixed(2)+' | '+(p.aggressor?'BUY-agg':'SELL-agg')+
+    '</div>';
+}
+
+function rowAutoSim(t){
+  return '<div class="row autotrade-sim">'+
+    'AUTOTRADE SIM '+t.symbol+' '+t.bias+
+    ' '+(t.right||'')+' '+t.strike+' '+(t.expiry||'')+
+    ' | side '+t.side+' qty '+t.qty+
+    ' | UL '+(t.ulPrice||0).toFixed(2)+
+    ' | mode '+t.mode+
     '</div>';
 }
 
@@ -1314,10 +1835,10 @@ function updateQuote(d) {
   if(d.type==='LIVE_QUOTE'){
     let displayText;
     if (details.symbol === 'UNKNOWN') {
-      displayText = '<span class="unknown">conid '+d.conid+'</span> | OPT +d.last.toFixed(2)+' | Δ '+d.delta.toFixed(3);
+      displayText = '<span class="unknown">conid '+d.conid+'</span> | OPT '+d.last.toFixed(2)+' | Δ '+d.delta.toFixed(3);
     } else {
       const rightDisplay = details.right === 'C' ? 'CALL' : (details.right === 'P' ? 'PUT' : '');
-      displayText = details.symbol+' '+rightDisplay+' +details.strike+' | OPT +d.last.toFixed(2)+' | Δ '+d.delta.toFixed(3);
+      displayText = details.symbol+' '+rightDisplay+' '+details.strike+' | OPT '+d.last.toFixed(2)+' | Δ '+d.delta.toFixed(3);
     }
     el.innerHTML = displayText+' | vol '+d.volume+' | '+new Date(d.timestamp).toLocaleTimeString();
   } else if(d.type==='UL_LIVE_QUOTE') {
@@ -1328,7 +1849,7 @@ function updateQuote(d) {
     } else {
       symbolDisplay = ulDetails.symbol + (ulDetails.type === 'UNDERLYING' ? ' UL' : '');
     }
-    el.innerHTML = symbolDisplay+' | last +d.last.toFixed(2)+' | vol '+d.volume+' | '+new Date(d.timestamp).toLocaleTimeString();
+    el.innerHTML = symbolDisplay+' | last '+d.last.toFixed(2)+' | vol '+d.volume+' | '+new Date(d.timestamp).toLocaleTimeString();
   }
 }
 
@@ -1349,6 +1870,11 @@ ws.onmessage=(e)=>{
   } else if(d.type==='PRINT'){
     const div=document.createElement('div');
     div.innerHTML=rowPrint(d);
+    out.insertBefore(div.firstElementChild,out.firstChild);
+    while(out.children.length>80) out.removeChild(out.lastChild);
+  } else if(d.type==='AUTOTRADE_SIM'){
+    const div=document.createElement('div');
+    div.innerHTML=rowAutoSim(d);
     out.insertBefore(div.firstElementChild,out.firstChild);
     while(out.children.length>80) out.removeChild(out.lastChild);
   } else if(d.type==='LIVE_QUOTE' || d.type==='UL_LIVE_QUOTE'){
@@ -1378,18 +1904,21 @@ setInterval(() => {
   
   server.listen(PORT, () => console.log('[server] listening on :'+PORT));
   
+  // periodic autotrade evaluation
+  if (AUTOTRADE.enabled) {
+    setInterval(() => {
+      evaluateAutotrade().catch(e => console.error('[AUTOTRADE evaluate error]', e.message));
+    }, 5000);
+  }
+  
   async function coordinatorLoop(){
     while(true){
       const futs = ['/ES','/NQ'];
       const eqs = ['SPY','QQQ','AAPL','TSLA'];
       
-      // Process futures
       for (const f of futs) await loopFuturesSymbol(f);
-      
-      // Process equities
       for (const s of eqs) await loopEquitySymbol(s);
       
-      // Poll live quotes
       await pollLiveQuotes();
       
       await sleep(1500);
@@ -1398,3 +1927,4 @@ setInterval(() => {
   
   coordinatorLoop().catch(e=>console.error('[coordinator]', e.message));
 })();
+
