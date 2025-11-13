@@ -9,7 +9,7 @@
  * - Emits TRADE + PRINT events; PRINT includes volume/OI ratio
  *
  * Run:
- * IBKR_HOST=https://127.0.0.1:5000 PORT=3000 NODE_TLS_REJECT_UNAUTHORIZED=0 node index.js
+ * IBKR_HOST=https://127.0.0.1:5000 PORT=3000 NODE_TLS_REJECT_UNAUTHORIZED=0 node index31_auto_cl.js
  */
 
 const http = require('http');
@@ -24,8 +24,11 @@ const WebSocket = require('ws');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const IBKR_HOST = process.env.IBKR_HOST || 'https://127.0.0.1:5000';
+const ACCOUNT_ID = process.env.IBKR_ACCOUNT_ID || null; // optional, for real closes
 
 const jar = new tough.CookieJar();
+
+// Configure axios with cookie jar (SSL handled via environment variable)
 const ax = wrapper(axios.create({
   baseURL: `${IBKR_HOST}/v1/api`,
   jar,
@@ -33,11 +36,18 @@ const ax = wrapper(axios.create({
   timeout: 15000
 }));
 
+// Set NODE_TLS_REJECT_UNAUTHORIZED=0 programmatically if not already set
+if (!process.env.NODE_TLS_REJECT_UNAUTHORIZED) {
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+  console.log('[SSL] Disabled certificate verification for IBKR self-signed cert');
+}
+
 /* --------------------------- App / WS ---------------------------------- */
 const app = express();
 app.use(compression());
 app.use(cors());
 app.use(morgan('tiny'));
+app.use(express.json());
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
@@ -59,7 +69,7 @@ const THRESHOLDS = {
   notable: { minPremium: 25000, minContracts: 25 },
   futuresSweep: { minPremium: 100000, minContracts: 50 },
   futuresBlock: { minPremium: 200000, minContracts: 25 },
-  futuresNotable:{ minPremium: 50000, minContracts: 10 }
+  futuresNotable: { minPremium: 50000, minContracts: 10 }
 };
 
 const FUTURES_SYMBOLS = {
@@ -75,43 +85,49 @@ const EQUITY_SYMBOLS = ['SPY','QQQ','AAPL','TSLA','NVDA','AMZN','MSFT','META','G
 
 /* --------------------------- Auto-Trade Config ------------------------- */
 const AUTO_TRADE_CONFIG = {
-  enabled: process.env.AUTO_TRADE === 'true', // Set AUTO_TRADE=true to enable
+  enabled: process.env.AUTO_TRADE === 'true',           // Set AUTO_TRADE=true to enable
+  paperTrade: process.env.PAPER_TRADE !== 'false',      // Default to paper trading (safer)
   maxPositionSize: parseInt(process.env.MAX_POSITION_SIZE || '5'), // Max contracts per trade
-  minConfidenceScore: 75, // Minimum confidence to consider
-  minStanceScore: 40, // Minimum stance score (bull/bear conviction)
-  signalWindow: 300000, // 5 minutes - time window to aggregate signals
-  minSignalsRequired: 3, // Minimum signals pointing same direction
-  riskPerTrade: 0.02, // 2% of account per trade
+  minConfidenceScore: 75,                               // Minimum confidence to consider
+  minStanceScore: 40,                                   // Minimum stance score (bull/bear conviction)
+  signalWindow: 300000,                                 // 5 minutes
+  minSignalsRequired: 3,                                // Minimum signals pointing same direction
+  riskPerTrade: 0.02,                                   // 2% of account per trade
   accountBalance: parseFloat(process.env.ACCOUNT_BALANCE || '10000'),
-  profitTarget: 0.25, // 25% profit target
-  stopLoss: 0.40, // 40% stop loss
+  profitTarget: 0.25,                                   // 25% profit target
+  stopLoss: 0.40,                                       // 40% stop loss
   maxDailyTrades: parseInt(process.env.MAX_DAILY_TRADES || '10'),
-  symbols: ['SPY', 'QQQ'] // Only auto-trade these liquid symbols
+  symbols: ['SPY', 'QQQ']                               // Only auto-trade these liquid symbols
 };
 
 /* --------------------------- Auto-Trade State -------------------------- */
-const tradeSignals = new Map(); // symbol -> [{timestamp, stance, score, premium, ...}]
-const activePositions = new Map(); // orderId -> {symbol, side, entry, target, stop, ...}
+const tradeSignals = new Map();        // symbol -> [{timestamp, stance, score, premium, ...}]
+const activePositions = new Map();     // orderId -> {symbol, side, entry, target, stop, ...}
+const paperPositions = new Map();      // paperId -> {symbol, side, entry, ...}
+const simulatedPositions = new Map();  // simId -> {symbol, side, entry, ...}
 const dailyTradeCount = { date: todayKey(), count: 0 };
-const orderHistory = []; // Track all orders
+const orderHistory = [];               // Track all orders
+let simulatedTradeIdCounter = 1;
+let paperTradeIdCounter = 1;
+let liveOrderIdCounter = 1;
 
 /* --------------------------- State ------------------------------------- */
-const historicalData = new Map(); // conid -> [{date, oi, volume, ts}]
-const liveQuotes = new Map(); // conid -> last quote cache
-const optionToUL = new Map(); // optionConid -> underlyingConid
-const prevVol = new Map(); // conid -> previous cumulative volume (for PRINT)
-const ulForOption = new Map(); // option conid -> { isFuture, mult, symbol, right, strike, expiry, oi }
-const dynamicConidMap = new Map(); // conid -> {symbol, strike, right, expiry, discoveredAt}
-const ulConidMap = new Map(); // ulConid -> symbol
+const historicalData = new Map();      // conid -> [{date, oi, volume, ts}]
+const liveQuotes = new Map();          // conid -> last quote cache
+const optionToUL = new Map();          // optionConid -> underlyingConid
+const prevVol = new Map();             // conid -> previous cumulative volume (for PRINT)
+const ulForOption = new Map();         // option conid -> { isFuture, mult, symbol, right, strike, expiry, oi }
+const dynamicConidMap = new Map();     // conid -> {symbol, strike, right, expiry, discoveredAt}
+const ulConidMap = new Map();          // ulConid -> symbol
 
 /* --------------------------- Utils ------------------------------------- */
-const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
-const nowISO = ()=>new Date().toISOString();
-const todayKey = ()=>new Date().toISOString().split('T')[0];
+function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+function nowISO(){ return new Date().toISOString(); }
+function todayKey(){ return new Date().toISOString().split('T')[0]; }
 
 function px(v){
   if (v == null) return 0;
-  const n = parseFloat(String(v).replace(/[^\d\.\-\+]/g, ''));
+  const n = parseFloat(String(v).replace(/[^\d.\-+]/g, ''));
   return isFinite(n) ? n : 0;
 }
 
@@ -165,6 +181,170 @@ function getHistoricalAverages(conid){
   };
 }
 
+/* ===================== Auto-Trading Signal Analysis ===================== */
+
+// Record a flow signal for auto-trading analysis
+function recordTradeSignal(trade) {
+  if (!AUTO_TRADE_CONFIG.enabled) return;
+  if (!AUTO_TRADE_CONFIG.symbols.includes(trade.symbol)) return;
+  if (!trade.stanceScore || !trade.confidence) return;
+
+  const signals = tradeSignals.get(trade.symbol) || [];
+
+  signals.push({
+    timestamp: Date.now(),
+    stance: trade.stanceLabel,
+    stanceScore: trade.stanceScore,
+    confidence: trade.confidence,
+    direction: trade.direction,
+    premium: trade.premium,
+    size: trade.size,
+    volOiRatio: trade.volOiRatio,
+    type: trade.type,
+    classifications: trade.classifications || [],
+    delta: trade.greeks?.delta || 0,
+    underlyingPrice: trade.underlyingPrice
+  });
+
+  // Keep only signals within time window
+  const cutoff = Date.now() - AUTO_TRADE_CONFIG.signalWindow;
+  const recent = signals.filter(s => s.timestamp >= cutoff);
+  tradeSignals.set(trade.symbol, recent);
+
+  // Analyze for trade opportunity
+  analyzeAndExecuteTrade(trade.symbol, recent);
+}
+
+// Analyze aggregated signals and determine if trade should be placed
+function analyzeAndExecuteTrade(symbol, signals) {
+  if (!AUTO_TRADE_CONFIG.enabled) return;
+  if (signals.length < AUTO_TRADE_CONFIG.minSignalsRequired) return;
+
+  // Check daily trade limit
+  if (dailyTradeCount.date !== todayKey()) {
+    dailyTradeCount.date = todayKey();
+    dailyTradeCount.count = 0;
+  }
+  if (dailyTradeCount.count >= AUTO_TRADE_CONFIG.maxDailyTrades) {
+    console.log(`[AUTO-TRADE] Daily limit reached (${dailyTradeCount.count})`);
+    return;
+  }
+
+  // Check if already in position for this symbol
+  const hasPosition = Array.from(activePositions.values())
+    .some(p => p.symbol === symbol && p.status === 'OPEN');
+  const hasPaperPosition = Array.from(paperPositions.values())
+    .some(p => p.symbol === symbol && p.status === 'OPEN');
+
+  if (hasPosition || hasPaperPosition) return;
+
+  // Aggregate signals
+  const analysis = {
+    bullSignals: 0,
+    bearSignals: 0,
+    totalStanceScore: 0,
+    avgConfidence: 0,
+    totalPremium: 0,
+    sweeps: 0,
+    blocks: 0,
+    highVolOI: 0,
+    openingTrades: 0, // BTO/STO
+    closingTrades: 0, // BTC/STC
+    avgDelta: 0,
+    lastPrice: 0
+  };
+
+  signals.forEach(s => {
+    if (s.stanceScore > 30) analysis.bullSignals++;
+    if (s.stanceScore < -30) analysis.bearSignals++;
+    analysis.totalStanceScore += s.stanceScore;
+    analysis.avgConfidence += s.confidence;
+    analysis.totalPremium += s.premium || 0;
+
+    if (s.classifications.includes('SWEEP')) analysis.sweeps++;
+    if (s.classifications.includes('BLOCK')) analysis.blocks++;
+    if (s.volOiRatio >= 2) analysis.highVolOI++;
+
+    if (s.direction === 'BTO' || s.direction === 'STO') analysis.openingTrades++;
+    if (s.direction === 'BTC' || s.direction === 'STC') analysis.closingTrades++;
+
+    analysis.avgDelta += Math.abs(s.delta);
+    analysis.lastPrice = s.underlyingPrice || analysis.lastPrice;
+  });
+
+  analysis.avgConfidence /= signals.length;
+  analysis.avgDelta /= signals.length;
+  const avgStanceScore = analysis.totalStanceScore / signals.length;
+
+  // Trading decision criteria
+  const criteria = {
+    strongConviction: Math.abs(avgStanceScore) >= AUTO_TRADE_CONFIG.minStanceScore,
+    highConfidence: analysis.avgConfidence >= AUTO_TRADE_CONFIG.minConfidenceScore,
+    significantFlow: analysis.totalPremium >= 500000, // $500k+ in premium
+    institutionalActivity: (analysis.sweeps + analysis.blocks) >= 2,
+    unusualVolume: analysis.highVolOI >= 2,
+    openingBias: analysis.openingTrades > analysis.closingTrades, // More opens than closes
+    directionalConsensus: false,
+    momentumConfirmed: false
+  };
+
+  // Check directional consensus (70%+ agreement)
+  const totalDirectional = analysis.bullSignals + analysis.bearSignals;
+  const bullRatio = totalDirectional ? analysis.bullSignals / totalDirectional : 0;
+  const bearRatio = totalDirectional ? analysis.bearSignals / totalDirectional : 0;
+  criteria.directionalConsensus = (bullRatio >= 0.70 || bearRatio >= 0.70);
+
+  // Check market momentum (underlying price movement)
+  const priceSignals = signals.map(s => s.underlyingPrice).filter(p => p > 0);
+  if (priceSignals.length >= 2) {
+    const priceChange = (priceSignals[priceSignals.length - 1] - priceSignals[0]) / priceSignals[0];
+    criteria.momentumConfirmed = Math.abs(priceChange) >= 0.002; // 0.2% move
+  }
+
+  // Determine trade side
+  let tradeSide = null;
+  if (bullRatio >= 0.70 && avgStanceScore > AUTO_TRADE_CONFIG.minStanceScore) {
+    tradeSide = 'BULL';
+  } else if (bearRatio >= 0.70 && avgStanceScore < -AUTO_TRADE_CONFIG.minStanceScore) {
+    tradeSide = 'BEAR';
+  }
+
+  // Count passed criteria
+  const passedCriteria = Object.values(criteria).filter(v => v === true).length;
+  const totalCriteria = Object.keys(criteria).length;
+
+  // Decision logic: Need at least 5/7 criteria
+  const shouldTrade = tradeSide && passedCriteria >= 5;
+
+  // Log analysis
+  console.log(`[AUTO-TRADE ANALYSIS] ${symbol}:`);
+  console.log(`  Signals: ${signals.length} (${analysis.bullSignals} bull, ${analysis.bearSignals} bear)`);
+  console.log(`  Avg Stance: ${avgStanceScore.toFixed(1)} | Confidence: ${analysis.avgConfidence.toFixed(1)}%`);
+  console.log(`  Premium: ${(analysis.totalPremium/1000).toFixed(0)}k | Sweeps: ${analysis.sweeps} | Blocks: ${analysis.blocks}`);
+  console.log(`  Criteria: ${passedCriteria}/${totalCriteria} passed`);
+  console.log(`  Decision: ${shouldTrade ? `TRADE ${tradeSide}` : 'NO TRADE'}`);
+
+  if (shouldTrade) {
+    const tradeDetails = {
+      symbol,
+      side: tradeSide,
+      avgStanceScore,
+      confidence: analysis.avgConfidence,
+      premium: analysis.totalPremium,
+      signals: signals.length,
+      criteria: passedCriteria,
+      price: analysis.lastPrice,
+      reasoning: Object.entries(criteria)
+        .filter(([k, v]) => v === true)
+        .map(([k]) => k)
+    };
+
+    executeAutoTrade(tradeDetails).catch(e =>
+      console.error('[AUTO-TRADE] executeAutoTrade error:', e.message)
+    );
+  }
+}
+
 /* --------------------------- IB helpers -------------------------------- */
 async function primeIB() {
   try { await ax.get('/sso/validate'); } catch {}
@@ -172,7 +352,7 @@ async function primeIB() {
     try {
       const { data } = await ax.get('/iserver/auth/status');
       if (data?.authenticated && data?.connected) {
-        console.log('\\n\\n[IB] authenticated & connected\\n');
+        console.log('\n\n[IB] authenticated & connected\n');
         return;
       }
       console.log('[IB] status:', data);
@@ -365,7 +545,7 @@ function chooseExpiryNear15DTE(list, { target=15, window=10 }){
 function pickContractsAroundATM({ contracts, underlyingPx, targetCount=25 }){
   const calls=[], puts=[];
   for (const c of contracts) {
-    const isCall = c.right === 'C' || /C\\b/.test(c.right||'') || /C\\b/.test(c.localSymbol||'') || /C\\b/.test(c.description||'');
+    const isCall = c.right === 'C' || /C\b/.test(c.right||'') || /C\b/.test(c.localSymbol||'') || /C\b/.test(c.description||'');
     const strike = +c.strike || 0;
     const rec = { ...c, isCall, strike, dist: Math.abs(strike - underlyingPx) };
     (isCall ? calls : puts).push(rec);
@@ -388,19 +568,19 @@ function maybeEmitPrint(optionMeta, row, isFuture, multiplier) {
   const last = px(row['31']);
   const volume = +row['7762'] || 0;
   const oi = optionMeta.oi ?? 0;
-  
+
   if (!volume) return;
-  
+
   const prevVolume = prevVol.get(conid) || 0;
   const tradeSize = volume - prevVolume;
   prevVol.set(conid, volume);
-  
+
   if (tradeSize > 0 && last > 0) {
     const bid = px(row['84']), ask = px(row['86']);
     const aggressor = last >= ask ? true : (last <= bid ? false : (ask && bid ? (Math.abs(last - ask) < Math.abs(last - bid)) : true));
     const volOiRatio = oi > 0 ? volume / oi : volume;
     const premium = tradeSize * last * multiplier;
-    
+
     broadcastAll({
       type: 'PRINT',
       conid,
@@ -450,19 +630,19 @@ async function buildFuturesOptionSelection(symbol, underlyingPx){
   const meta = FUTURES_SYMBOLS[symbol];
   const fut = await getFrontFuture(symbol);
   if (!fut) return { ulConid:null, options:[] };
-  
+
   let month;
   try {
     const root = symbol.replace('/','').toUpperCase();
     const monthsData = await ibGet('/trsrv/futures', { symbols: root });
     month = pickMonthFromTrsrv(root, monthsData);
   } catch { month = null; }
-  
+
   if (!month) {
     const d = new Date();
     month = `${d.getUTCFullYear()}${String(d.getUTCMonth()+1).padStart(2,'0')}`;
   }
-  
+
   let info = [];
   try {
     info = await ibGet('/iserver/secdef/info', {
@@ -481,7 +661,7 @@ async function buildFuturesOptionSelection(symbol, underlyingPx){
   } catch (e) {
     console.error('[FOP INFO]', symbol, e.response?.status, e.response?.data || e.message);
   }
-  
+
   const raw = Array.isArray(info) ? info : [];
   const norm = raw.map(x => ({
     conid: x.conid,
@@ -491,12 +671,12 @@ async function buildFuturesOptionSelection(symbol, underlyingPx){
     exchange: 'CME',
     symbol
   }));
-  
+
   const coarse = norm.filter(c => c.strike > 0);
   const near = coarse.filter(c => Math.abs((c.strike - underlyingPx)/Math.max(1,underlyingPx)) < 0.20);
   const base = near.length >= 12 ? near : coarse;
   const picked = pickContractsAroundATM({ contracts: base, underlyingPx, targetCount: 25 });
-  
+
   return { ulConid: fut.conid, options: picked };
 }
 
@@ -504,73 +684,73 @@ async function buildFuturesOptionSelection(symbol, underlyingPx){
 async function buildEquityOptionSelection(symbol, underlyingPx) {
   const stkConid = await findStockConid(symbol);
   if (!stkConid) return { ulConid: null, options: [] };
-  
+
   console.log(`[EQ] Building option selection for ${symbol}, UL price: ${underlyingPx}, Stock conid: ${stkConid}`);
-  
+
   let allOptions = [];
-  
+
   try {
     // Step 1: Get available expiries from search
     const searchResult = await secdefSearch(symbol, 'OPT');
     const optSection = searchResult?.[0]?.sections?.find(s => s.secType === 'OPT');
     const monthsStr = optSection?.months; // e.g., "NOV25;DEC25;JAN26;..."
-    
+
     if (!monthsStr) {
       console.log(`[EQ] No option months found for ${symbol}`);
       return { ulConid: stkConid, options: [] };
     }
-    
+
     console.log(`[EQ] Available months for ${symbol}: ${monthsStr}`);
-    
+
     // Step 2: Pick the expiry closest to 15 DTE
     const targetExpiry = pickEquityYYYYMMFromMonthsString(monthsStr, { targetDte: 15 });
-    
+
     if (!targetExpiry) {
       console.log(`[EQ] Could not determine target expiry for ${symbol}`);
       return { ulConid: stkConid, options: [] };
     }
-    
+
     console.log(`[EQ] Target expiry for ${symbol}: ${targetExpiry} (YYYYMM)`);
-    
+
     // Step 3: Get strikes using secdef/strikes
     const strikesData = await ibGet('/iserver/secdef/strikes', {
       conid: stkConid,
       sectype: 'OPT',
       month: targetExpiry
     });
-    
+
     if (!strikesData || !strikesData.call || !strikesData.put) {
       console.log(`[EQ] No strikes data for ${symbol} month ${targetExpiry}`);
       return { ulConid: stkConid, options: [] };
     }
-    
+
     const callStrikes = strikesData.call || [];
     const putStrikes = strikesData.put || [];
-    
+
     console.log(`[EQ] Strikes for ${symbol}: ${callStrikes.length} calls, ${putStrikes.length} puts`);
-    
+
     // Step 4: Filter strikes to ATM range (±20% from underlying)
     const minStrike = underlyingPx * 0.80;
     const maxStrike = underlyingPx * 1.20;
-    
+
     const atmCallStrikes = callStrikes
       .filter(s => s >= minStrike && s <= maxStrike)
       .sort((a, b) => Math.abs(a - underlyingPx) - Math.abs(b - underlyingPx))
       .slice(0, 15); // Top 15 closest
-    
+
     const atmPutStrikes = putStrikes
       .filter(s => s >= minStrike && s <= maxStrike)
       .sort((a, b) => Math.abs(a - underlyingPx) - Math.abs(b - underlyingPx))
       .slice(0, 15); // Top 15 closest
-    
+
     console.log(`[EQ] ATM strikes: ${atmCallStrikes.length} calls, ${atmPutStrikes.length} puts`);
-    
+
     // Step 5: Get conids for each strike using secdef/info
     const strikesToQuery = [
       ...atmCallStrikes.map(s => ({ strike: s, right: 'C' })),
       ...atmPutStrikes.map(s => ({ strike: s, right: 'P' }))
     ];
-    
+
     for (const { strike, right } of strikesToQuery) {
       try {
         const info = await ibGet('/iserver/secdef/info', {
@@ -580,7 +760,7 @@ async function buildEquityOptionSelection(symbol, underlyingPx) {
           strike: strike.toString(),
           right: right
         });
-        
+
         if (info && info[0] && info[0].conid) {
           allOptions.push({
             conid: info[0].conid,
@@ -591,30 +771,30 @@ async function buildEquityOptionSelection(symbol, underlyingPx) {
             symbol
           });
         }
-        
+
         await sleep(50); // Rate limit
       } catch (e) {
         console.log(`[EQ] Failed to get conid for ${symbol} ${right} ${strike}:`, e.message);
       }
     }
-    
+
     console.log(`[EQ] ✅ Found ${allOptions.length} option conids for ${symbol}`);
-    
+
     if (allOptions.length === 0) {
       console.log(`[EQ] ❌ No valid options found for ${symbol}`);
       return { ulConid: stkConid, options: [] };
     }
-    
+
     // Step 6: Interleave calls and puts for balanced selection
     const picked = pickContractsAroundATM({
       contracts: allOptions,
       underlyingPx,
       targetCount: 25
     });
-    
+
     console.log(`[EQ] ✅ Selected ${picked.length} options for ${symbol}`);
     return { ulConid: stkConid, options: picked };
-    
+
   } catch (e) {
     console.error(`[EQ BUILD] ${symbol}:`, e.response?.data || e.message);
     return { ulConid: stkConid, options: [] };
@@ -626,11 +806,11 @@ function pickEquityYYYYMMFromMonthsString(monthsStr, { targetDte = 15 } = {}) {
   if (!monthsStr) return null;
   const TOK = monthsStr.split(';').map(s => s.trim()).filter(Boolean);
   if (!TOK.length) return null;
-  
+
   const M = { JAN:1,FEB:2,MAR:3,APR:4,MAY:5,JUN:6,JUL:7,AUG:8,SEP:9,OCT:10,NOV:11,DEC:12 };
   const now = new Date();
   const candidates = [];
-  
+
   for (const t of TOK) {
     const mm3 = t.slice(0,3).toUpperCase();
     const yy2 = t.slice(3);
@@ -638,13 +818,13 @@ function pickEquityYYYYMMFromMonthsString(monthsStr, { targetDte = 15 } = {}) {
     if (!m) continue;
     const y = 2000 + (+yy2 || 0);
     const midMonth = new Date(Date.UTC(y, m - 1, 15));
-    const dte = Math.ceil((midMonth - now) / 86400000);
+    const dteDays = Math.ceil((midMonth - now) / 86400000);
     candidates.push({
       yyyymm: `${y}${String(m).padStart(2,'0')}`,
-      delta: Math.abs(dte - targetDte)
+      delta: Math.abs(dteDays - targetDte)
     });
   }
-  
+
   if (!candidates.length) return null;
   candidates.sort((a,b)=>a.delta-b.delta);
   return candidates[0].yyyymm;
@@ -654,17 +834,20 @@ function pickEquityYYYYMMFromMonthsString(monthsStr, { targetDte = 15 } = {}) {
 async function captureUnderlying(ulConid) {
   const snap = await mdSnapshot([ulConid]);
   const row = snap?.[0] || {};
-  
+
   if (!ulConidMap.has(ulConid)) {
+    // Try to match futures ULs
     for (const [symbol, meta] of Object.entries(FUTURES_SYMBOLS)) {
-      const fut = await getFrontFuture(symbol);
-      if (fut && fut.conid === ulConid) {
-        updateULMapping(ulConid, symbol);
-        break;
-      }
+      try {
+        const fut = await getFrontFuture(symbol);
+        if (fut && fut.conid === ulConid) {
+          updateULMapping(ulConid, symbol);
+          break;
+        }
+      } catch {}
     }
   }
-  
+
   broadcastLiveUL(ulConid, row);
   return { price: px(row['31']), row };
 }
@@ -676,15 +859,15 @@ function buildTradePayload({ optionMeta, isFuture, ulConid, ul, optRow, multipli
   const bid = px(optRow['84']);
   const ask = px(optRow['86']);
   const greeks = calcGreeks(optRow);
-  
+
   if (oi != null) storeHistoricalData(optionMeta.conid, oi, vol);
   const hist = getHistoricalAverages(optionMeta.conid);
-  
+
   const size = vol;
   const premium = last * size * multiplier;
   const aggressor = last >= ask ? true : (last <= bid ? false : (ask && bid ? (Math.abs(last-ask) < Math.abs(last-bid)) : true));
   const volOiRatio = oi > 0 ? (vol/oi) : vol;
-  
+
   const trade = {
     symbol: optionMeta.symbol,
     assetClass: isFuture ? 'FUTURES_OPTION' : 'EQUITY_OPTION',
@@ -707,11 +890,11 @@ function buildTradePayload({ optionMeta, isFuture, ulConid, ul, optRow, multipli
     greeks,
     volOiRatio
   };
-  
+
   const direction = classifyTradeUWStyle(trade, oi, vol, hist);
   const confidence = confidenceScore(trade, oi, vol, hist);
   const tags = classifySizeTags(trade, isFuture);
-  
+
   return {
     payload: {
       type:'TRADE',
@@ -738,10 +921,10 @@ async function processOptionConid(optionMeta, isFuture, ulConid, multiplier) {
       mdSnapshot([optionMeta.conid]),
       captureUnderlying(ulConid)
     ]);
-    
+
     const optRow = optSnap?.[0];
     if (!optRow) return;
-    
+
     updateConidMapping(
       optionMeta.conid,
       optionMeta.symbol,
@@ -750,7 +933,7 @@ async function processOptionConid(optionMeta, isFuture, ulConid, multiplier) {
       optionMeta.expiry
     );
     updateULMapping(ulConid, optionMeta.symbol);
-    
+
     optionToUL.set(optionMeta.conid, ulConid);
     ulForOption.set(optionMeta.conid, {
       isFuture,
@@ -761,7 +944,7 @@ async function processOptionConid(optionMeta, isFuture, ulConid, multiplier) {
       expiry: optionMeta.expiry,
       oi: optionMeta.oi ?? null
     });
-    
+
     const { payload, optRow: rowForPrint } = buildTradePayload({
       optionMeta,
       isFuture,
@@ -770,14 +953,13 @@ async function processOptionConid(optionMeta, isFuture, ulConid, multiplier) {
       optRow,
       multiplier
     });
-    
+
     if (payload && payload.premium >= 1000) {
       broadcastAll(payload);
-      
       // Record signal for auto-trading
       recordTradeSignal(payload);
     }
-    
+
     maybeEmitPrint(optionMeta, rowForPrint, isFuture, multiplier);
     broadcastLiveOption(optionMeta.conid, optRow);
   } catch (error) {
@@ -789,16 +971,16 @@ async function loopFuturesSymbol(symbol) {
   try {
     const fut = await getFrontFuture(symbol);
     if (!fut) return;
-    
+
     const ulSnap = await mdSnapshot([fut.conid]);
     const ulRow = ulSnap?.[0] || {};
     const ulPx = px(ulRow['31']);
     broadcastLiveUL(fut.conid, ulRow);
-    
+
     if (!ulPx || ulPx < 0) return;
-    
+
     const { ulConid, options } = await buildFuturesOptionSelection(symbol, ulPx);
-    
+
     for (const meta of options) {
       try {
         await processOptionConid(meta, true, ulConid, FUTURES_SYMBOLS[symbol].multiplier);
@@ -816,18 +998,18 @@ async function loopEquitySymbol(symbol){
   try{
     const stkConid = await findStockConid(symbol);
     if (!stkConid) return;
-    
+
     const ulSnap = await mdSnapshot([stkConid]);
     const ulRow = ulSnap?.[0] || {};
     const ulPx = px(ulRow['31']);
     broadcastLiveUL(stkConid, ulRow);
-    
+
     if (!ulPx || ulPx < 0) return;
-    
+
     const { ulConid, options } = await buildEquityOptionSelection(symbol, ulPx);
-    
+
     console.log(`[EQ LOOP] ${symbol} processing ${options.length} options`);
-    
+
     for (const meta of options) {
       try {
         await processOptionConid(meta, false, ulConid, 100);
@@ -845,13 +1027,13 @@ async function pollLiveQuotes(){
   try{
     const optionConids = Array.from(optionToUL.keys());
     if (!optionConids.length) return;
-    
+
     const snaps = await mdSnapshot(optionConids);
     for (let i=0;i<snaps.length;i++){
       const row = snaps[i] || {};
       const conid = row.conid || optionConids[i];
       broadcastLiveOption(conid, row);
-      
+
       const meta = ulForOption.get(conid);
       if (meta) {
         const optionMeta = {
@@ -864,7 +1046,7 @@ async function pollLiveQuotes(){
         };
         maybeEmitPrint(optionMeta, row, meta.isFuture, meta.mult);
       }
-      
+
       const ulConid = optionToUL.get(conid);
       if (ulConid) {
         const ulSnap = await mdSnapshot([ulConid]);
@@ -879,14 +1061,14 @@ function cleanupOldMappings() {
   const now = Date.now();
   const thirtyDaysAgo = now - (30 * 24 * 60 * 60 * 1000);
   let cleaned = 0;
-  
+
   for (const [conid, mapping] of dynamicConidMap.entries()) {
     if (mapping.lastSeen < thirtyDaysAgo) {
       dynamicConidMap.delete(conid);
       cleaned++;
     }
   }
-  
+
   if (cleaned > 0) {
     console.log(`[MAPPING] Cleaned up ${cleaned} old conid mappings`);
   }
@@ -894,27 +1076,386 @@ function cleanupOldMappings() {
 
 setInterval(cleanupOldMappings, 60 * 60 * 1000);
 
+/* ===================== Position Monitoring ===================== */
+
+// Monitor open positions and manage exits (real, paper, and simulated)
+async function monitorPositions() {
+  if (!AUTO_TRADE_CONFIG.enabled) return;
+
+  // Monitor REAL positions
+  for (const [orderId, position] of activePositions.entries()) {
+    if (position.status !== 'OPEN') continue;
+
+    try {
+      const optSnap = await mdSnapshot([position.optionConid]);
+      const optData = optSnap?.[0];
+      const currentPrice = px(optData?.['31']);
+
+      if (!currentPrice || currentPrice <= 0) continue;
+
+      position.current = currentPrice;
+      const pnl = (currentPrice - position.entry) / position.entry;
+      const dollarPnl = (currentPrice - position.entry) * position.contracts * 100;
+
+      console.log(`[LIVE] ${position.symbol} ${position.type} ${position.strike} | Entry: ${position.entry.toFixed(2)} | Current: ${currentPrice.toFixed(2)} | P&L: ${(pnl*100).toFixed(1)}% (${dollarPnl.toFixed(0)})`);
+
+      let shouldExit = false;
+      let exitReason = '';
+
+      if (currentPrice >= position.profitTarget) {
+        shouldExit = true;
+        exitReason = 'PROFIT_TARGET';
+      } else if (currentPrice <= position.stopLoss) {
+        shouldExit = true;
+        exitReason = 'STOP_LOSS';
+      }
+
+      const holdTime = Date.now() - position.openTime;
+      if (holdTime > 2 * 24 * 60 * 60 * 1000) {
+        shouldExit = true;
+        exitReason = 'TIME_EXIT';
+      }
+
+      if (shouldExit) {
+        await closePosition(orderId, position, currentPrice, exitReason);
+      }
+
+      // Broadcast live update
+      broadcastAll({
+        type: 'LIVE_POSITION_UPDATE',
+        orderId,
+        symbol: position.symbol,
+        current: currentPrice,
+        pnl: (pnl * 100).toFixed(2),
+        dollarPnl: dollarPnl.toFixed(0),
+        timestamp: Date.now()
+      });
+
+    } catch (error) {
+      console.error(`[LIVE] Error monitoring ${position.symbol}:`, error.message);
+    }
+  }
+
+  // Monitor PAPER positions
+  for (const [paperId, position] of paperPositions.entries()) {
+    if (position.status !== 'OPEN') continue;
+
+    try {
+      const optSnap = await mdSnapshot([position.optionConid]);
+      const optData = optSnap?.[0];
+      const bid = px(optData?.['84']);
+      const ask = px(optData?.['86']);
+      const currentPrice = (bid + ask) / 2; // Paper trade at mid
+
+      if (!currentPrice || currentPrice <= 0) continue;
+
+      position.current = currentPrice;
+      position.bid = bid;
+      position.ask = ask;
+      const pnl = (currentPrice - position.entry) / position.entry;
+      const dollarPnl = (currentPrice - position.entry) * position.contracts * 100;
+
+      console.log(
+        `[PAPER] ${position.symbol} ${position.type} ${position.strike} | Entry: ${position.entry.toFixed(2)} | Current: ${currentPrice.toFixed(2)} (${bid.toFixed(2)}/${ask.toFixed(2)}) | P&L: ${(pnl*100).toFixed(1)}% (${dollarPnl.toFixed(0)})`
+      );
+
+      // Check exit conditions
+      let shouldExit = false;
+      let exitReason = '';
+
+      if (currentPrice >= position.profitTarget) {
+        shouldExit = true;
+        exitReason = 'PROFIT_TARGET';
+      } else if (currentPrice <= position.stopLoss) {
+        shouldExit = true;
+        exitReason = 'STOP_LOSS';
+      }
+
+      const holdTime = Date.now() - position.openTime;
+      if (holdTime > 2 * 24 * 60 * 60 * 1000) {
+        shouldExit = true;
+        exitReason = 'TIME_EXIT';
+      }
+
+      if (shouldExit) {
+        position.status = 'CLOSED';
+        position.exitPrice = currentPrice;
+        position.exitReason = exitReason;
+        position.closeTime = Date.now();
+        position.pnl = pnl;
+        position.dollarPnl = dollarPnl;
+
+        console.log(
+          `[PAPER] Closed ${position.symbol} | P&L: ${(pnl*100).toFixed(1)}% (${dollarPnl.toFixed(0)}) | Reason: ${exitReason}`
+        );
+
+        broadcastAll({
+          type: 'PAPER_TRADE_CLOSED',
+          paperId,
+          symbol: position.symbol,
+          pnl: (pnl * 100).toFixed(1) + '%',
+          dollarPnl: dollarPnl.toFixed(0),
+          reason: exitReason,
+          entry: position.entry,
+          exit: currentPrice,
+          timestamp: Date.now()
+        });
+      } else {
+        // Broadcast live update
+        broadcastAll({
+          type: 'PAPER_POSITION_UPDATE',
+          paperId,
+          symbol: position.symbol,
+          current: currentPrice,
+          bid,
+          ask,
+          pnl: (pnl * 100).toFixed(2),
+          dollarPnl: dollarPnl.toFixed(0),
+          timestamp: Date.now()
+        });
+      }
+
+    } catch (error) {
+      console.error(`[PAPER] Error monitoring ${position.symbol}:`, error.message);
+    }
+  }
+
+  // Monitor SIMULATED positions
+  for (const [simId, position] of simulatedPositions.entries()) {
+    if (position.status !== 'OPEN') continue;
+
+    try {
+      const optSnap = await mdSnapshot([position.optionConid]);
+      const optData = optSnap?.[0];
+      const bid = px(optData?.['84']);
+      const ask = px(optData?.['86']);
+      const currentPrice = (bid + ask) / 2;
+
+      if (!currentPrice || currentPrice <= 0) continue;
+
+      position.current = currentPrice;
+      const pnl = (currentPrice - position.entry) / position.entry;
+      const dollarPnl = (currentPrice - position.entry) * position.contracts * 100;
+
+      let shouldExit = false;
+      let exitReason = '';
+
+      if (currentPrice >= position.profitTarget) {
+        shouldExit = true;
+        exitReason = 'PROFIT_TARGET';
+      } else if (currentPrice <= position.stopLoss) {
+        shouldExit = true;
+        exitReason = 'STOP_LOSS';
+      }
+
+      const holdTime = Date.now() - position.openTime;
+      if (holdTime > 2 * 24 * 60 * 60 * 1000) {
+        shouldExit = true;
+        exitReason = 'TIME_EXIT';
+      }
+
+      if (shouldExit) {
+        position.status = 'CLOSED';
+        position.exitPrice = currentPrice;
+        position.exitReason = exitReason;
+        position.closeTime = Date.now();
+        position.pnl = pnl;
+        position.dollarPnl = dollarPnl;
+
+        broadcastAll({
+          type: 'SIMULATED_TRADE_CLOSED',
+          simId,
+          symbol: position.symbol,
+          pnl: (pnl * 100).toFixed(1) + '%',
+          dollarPnl: dollarPnl.toFixed(0),
+          reason: exitReason,
+          timestamp: Date.now()
+        });
+      } else {
+        broadcastAll({
+          type: 'SIMULATED_POSITION_UPDATE',
+          simId,
+          symbol: position.symbol,
+          current: currentPrice,
+          pnl: (pnl * 100).toFixed(2),
+          dollarPnl: dollarPnl.toFixed(0),
+          timestamp: Date.now()
+        });
+      }
+
+    } catch (error) {
+      console.error(`[SIMULATED] Error monitoring ${position.symbol}:`, error.message);
+    }
+  }
+}
+
+// Close a position (REAL, with optional live order)
+async function closePosition(orderId, position, exitPrice, reason) {
+  try {
+    console.log(`[AUTO-TRADE] 🔄 CLOSING position ${position.symbol} - Reason: ${reason}`);
+
+    if (!AUTO_TRADE_CONFIG.paperTrade && ACCOUNT_ID) {
+      const sellOrder = {
+        conid: position.optionConid,
+        orderType: 'LMT',
+        listingExchange: 'SMART',
+        side: 'SELL',
+        quantity: position.contracts,
+        price: exitPrice * 0.98,
+        tif: 'DAY'
+      };
+
+      try {
+        await ax.post(`/iserver/account/${ACCOUNT_ID}/orders`, {
+          orders: [sellOrder]
+        });
+      } catch (e) {
+        console.error('[AUTO-TRADE] Error sending close order (continuing local close):', e.response?.data || e.message);
+      }
+    }
+
+    const pnl = (exitPrice - position.entry) / position.entry;
+    const dollarPnl = (exitPrice - position.entry) * position.contracts * 100;
+
+    console.log(`[AUTO-TRADE] ✅ Position closed:`);
+    console.log(`  P&L: ${(pnl*100).toFixed(1)}% (${dollarPnl.toFixed(0)})`);
+    console.log(`  Reason: ${reason}`);
+
+    position.status = 'CLOSED';
+    position.exitPrice = exitPrice;
+    position.exitReason = reason;
+    position.closeTime = Date.now();
+    position.pnl = pnl;
+    position.dollarPnl = dollarPnl;
+
+    broadcastAll({
+      type: 'AUTO_TRADE_CLOSED',
+      orderId,
+      symbol: position.symbol,
+      pnl: (pnl * 100).toFixed(1) + '%',
+      dollarPnl: dollarPnl.toFixed(0),
+      reason,
+      timestamp: Date.now()
+    });
+
+  } catch (error) {
+    console.error(`[AUTO-TRADE] ❌ Error closing position:`, error.message);
+  }
+}
+
+/* ===================== Auto-Trade Execution (stub) ===================== */
+
+// Very simple stub: logs the decision, creates a PAPER position with no real order.
+// You can later upgrade this to choose a specific option & place live orders.
+async function executeAutoTrade(details) {
+  try {
+    dailyTradeCount.count += 1;
+
+    const sideLabel = details.side === 'BULL' ? 'CALL' : 'PUT';
+    const entryPrice = details.price || 1; // fallback
+    const contractsByRisk = Math.max(
+      1,
+      Math.min(
+        AUTO_TRADE_CONFIG.maxPositionSize,
+        Math.floor(
+          (AUTO_TRADE_CONFIG.accountBalance * AUTO_TRADE_CONFIG.riskPerTrade) /
+          (entryPrice * 100 || 1)
+        )
+      )
+    );
+
+    const orderId = `LIVE-${liveOrderIdCounter++}`;
+    const paperId = `PAPER-${paperTradeIdCounter++}`;
+
+    const basePosition = {
+      symbol: details.symbol,
+      side: details.side,
+      type: sideLabel,
+      strike: NaN,
+      expiry: 'AUTO',
+      optionConid: null,
+      contracts: contractsByRisk,
+      entry: entryPrice,
+      current: entryPrice,
+      profitTarget: entryPrice * (1 + AUTO_TRADE_CONFIG.profitTarget),
+      stopLoss: entryPrice * (1 - AUTO_TRADE_CONFIG.stopLoss),
+      underlyingPrice: details.price,
+      status: 'OPEN',
+      openTime: Date.now()
+    };
+
+    if (AUTO_TRADE_CONFIG.paperTrade) {
+      paperPositions.set(paperId, { ...basePosition, tradeType: 'PAPER' });
+      console.log(`[AUTO-TRADE] (PAPER) ${details.side} ${details.symbol} x${contractsByRisk} @ ~${entryPrice.toFixed(2)}`);
+    } else {
+      activePositions.set(orderId, { ...basePosition, tradeType: 'LIVE' });
+      console.log(`[AUTO-TRADE] (LIVE STUB) ${details.side} ${details.symbol} x${contractsByRisk} @ ~${entryPrice.toFixed(2)}`);
+    }
+
+    broadcastAll({
+      type: 'AUTO_TRADE_EXECUTED',
+      symbol: details.symbol,
+      side: details.side,
+      contracts: contractsByRisk,
+      entry: entryPrice,
+      profitTarget: entryPrice * (1 + AUTO_TRADE_CONFIG.profitTarget),
+      stopLoss: entryPrice * (1 - AUTO_TRADE_CONFIG.stopLoss),
+      reasoning: details.reasoning || [],
+      timestamp: Date.now()
+    });
+
+  } catch (e) {
+    console.error('[AUTO-TRADE] executeAutoTrade stub error:', e.message);
+  }
+}
+
 /* ------------------------- HTTP Routes -------------------------------- */
 app.get('/health', (req,res)=>res.json({ ok:true, ts:Date.now() }));
 
 app.get('/auto-trade/status', (req, res) => {
+  const allPositions = [
+    ...Array.from(activePositions.values()).map(p => ({ ...p, tradeType: 'LIVE' })),
+    ...Array.from(paperPositions.values()).map(p => ({ ...p, tradeType: 'PAPER' })),
+    ...Array.from(simulatedPositions.values()).map(p => ({ ...p, tradeType: 'MANUAL_SIM' }))
+  ];
+
+  const recentOrders = [
+    ...orderHistory,
+    ...Array.from(paperPositions.values()),
+    ...Array.from(simulatedPositions.values())
+  ].sort((a, b) => (b.openTime || 0) - (a.openTime || 0));
+
   res.json({
     enabled: AUTO_TRADE_CONFIG.enabled,
+    paperTrade: AUTO_TRADE_CONFIG.paperTrade,
     config: AUTO_TRADE_CONFIG,
-    positions: Array.from(activePositions.values()),
+    positions: allPositions,
     dailyTrades: dailyTradeCount,
-    recentOrders: orderHistory.slice(-20),
+    recentOrders: recentOrders.slice(0, 50),
     signals: Object.fromEntries(
-      Array.from(tradeSignals.entries()).map(([symbol, signals]) => [
+      Array.from(tradeSignals.entries()).map(([symbol, sigs]) => [
         symbol,
         {
-          count: signals.length,
-          bullish: signals.filter(s => s.stanceScore > 30).length,
-          bearish: signals.filter(s => s.stanceScore < -30).length,
-          avgStance: signals.reduce((sum, s) => sum + s.stanceScore, 0) / signals.length || 0
+          count: sigs.length,
+          bullish: sigs.filter(s => s.stanceScore > 30).length,
+          bearish: sigs.filter(s => s.stanceScore < -30).length,
+          avgStance: sigs.reduce((sum, s) => sum + s.stanceScore, 0) / (sigs.length || 1)
         }
       ])
-    )
+    ),
+    stats: {
+      live: {
+        open: Array.from(activePositions.values()).filter(p => p.status === 'OPEN').length,
+        closed: orderHistory.filter(o => o.type === 'LIVE' && o.status === 'CLOSED').length
+      },
+      paper: {
+        open: Array.from(paperPositions.values()).filter(p => p.status === 'OPEN').length,
+        closed: Array.from(paperPositions.values()).filter(p => p.status === 'CLOSED').length,
+        totalPnL: Array.from(paperPositions.values())
+          .filter(p => p.status === 'CLOSED')
+          .reduce((sum, p) => sum + (p.dollarPnl || 0), 0)
+      }
+    }
   });
 });
 
@@ -933,19 +1474,19 @@ app.post('/auto-trade/disable', (req, res) => {
 app.post('/auto-trade/close-all', async (req, res) => {
   try {
     const closedPositions = [];
-    
+
     for (const [orderId, position] of activePositions.entries()) {
       if (position.status === 'OPEN') {
         const optSnap = await mdSnapshot([position.optionConid]);
         const currentPrice = px(optSnap?.[0]?.['31']);
-        
+
         if (currentPrice > 0) {
           await closePosition(orderId, position, currentPrice, 'MANUAL_CLOSE_ALL');
           closedPositions.push(position.symbol);
         }
       }
     }
-    
+
     res.json({
       message: 'All positions closed',
       closed: closedPositions
@@ -953,6 +1494,20 @@ app.post('/auto-trade/close-all', async (req, res) => {
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
+});
+
+// simple simulated route kept if you want to use it later
+app.get('/auto-trade/simulated', (req, res) => {
+  res.json({
+    positions: Array.from(simulatedPositions.values()),
+    stats: {
+      open: Array.from(simulatedPositions.values()).filter(p => p.status === 'OPEN').length,
+      closed: Array.from(simulatedPositions.values()).filter(p => p.status === 'CLOSED').length,
+      totalPnL: Array.from(simulatedPositions.values())
+        .filter(p => p.status === 'CLOSED')
+        .reduce((sum, p) => sum + (p.dollarPnl || 0), 0)
+    }
+  });
 });
 
 app.get('/debug/conid-mapping', (req, res) => {
@@ -963,7 +1518,7 @@ app.get('/debug/conid-mapping', (req, res) => {
       discoveredAgo: Math.round((Date.now() - value.discoveredAt) / 1000) + 's ago'
     };
   });
-  
+
   const ulMappings = {};
   ulConidMap.forEach((value, key) => {
     ulMappings[key] = {
@@ -971,7 +1526,7 @@ app.get('/debug/conid-mapping', (req, res) => {
       discoveredAgo: Math.round((Date.now() - value.discoveredAt) / 1000) + 's ago'
     };
   });
-  
+
   res.json({
     option_mappings: mappings,
     underlying_mappings: ulMappings,
@@ -983,91 +1538,24 @@ app.get('/debug/conid-mapping', (req, res) => {
   });
 });
 
-app.get('/debug/equity-options/:symbol', async (req, res) => {
-  try {
-    const { symbol } = req.params;
-    const stkConid = await findStockConid(symbol);
-    
-    if (!stkConid) {
-      return res.json({ error: 'Stock not found', symbol });
-    }
-    
-    // Get underlying price
-    const ulSnap = await mdSnapshot([stkConid]);
-    const ulPx = px(ulSnap?.[0]?.['31']);
-    
-    const results = {
-      symbol,
-      stkConid,
-      underlyingPrice: ulPx,
-      methods: {}
-    };
-    
-    // Try Method 1: secdef/strikes
-    try {
-      const strikes = await ibGet('/iserver/secdef/strikes', {
-        conid: stkConid,
-        sectype: 'OPT',
-        month: 'ALL'
-      });
-      results.methods.strikes = strikes;
-    } catch (e) {
-      results.methods.strikes = { error: e.message };
-    }
-    
-    // Try Method 2: secdef/info
-    try {
-      const info = await ibGet('/iserver/secdef/info', {
-        conid: stkConid,
-        sectype: 'OPT',
-        month: 'ALL'
-      });
-      results.methods.info = {
-        count: info?.length || 0,
-        sample: info?.slice(0, 3)
-      };
-    } catch (e) {
-      results.methods.info = { error: e.message };
-    }
-    
-    // Try Method 3: secdef/search
-    try {
-      const search = await secdefSearch(symbol, 'OPT');
-      results.methods.search = {
-        count: search?.length || 0,
-        sample: search?.slice(0, 3)
-      };
-    } catch (e) {
-      results.methods.search = { error: e.message };
-    }
-    
-    res.json(results);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
 app.get('/debug/contracts/:symbol', async (req, res) => {
   try {
     const { symbol } = req.params;
     console.log(`[DEBUG] Searching contracts for: ${symbol}`);
-    
+
     const types = ['STK', 'OPT', 'FUT', 'FOP'];
     const results = {};
-    
+
     for (const type of types) {
       try {
         const data = await secdefSearch(symbol, type);
         results[type] = data || [];
         console.log(`[DEBUG] ${type} results:`, data?.length || 0);
-        if (data && data.length > 0) {
-          console.log(`[DEBUG] First ${type} contract:`, JSON.stringify(data[0], null, 2));
-        }
       } catch (e) {
         results[type] = { error: e.message };
       }
     }
-    
+
     res.json(results);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1083,7 +1571,7 @@ const DEFAULT_SUBS = {
 wss.on('connection', (ws)=>{
   clients.add(ws);
   ws._subs = { ...DEFAULT_SUBS };
-  
+
   const initialMappings = {};
   dynamicConidMap.forEach((value, key) => {
     initialMappings[key] = value;
@@ -1091,7 +1579,7 @@ wss.on('connection', (ws)=>{
   ulConidMap.forEach((value, key) => {
     initialMappings[key] = value;
   });
-  
+
   ws.send(JSON.stringify({
     type:'connected',
     message:'Connected to IBKR Flow (Equities + Futures) - 25 ATM, ~15 DTE with live quotes, prints & BTO/STO/BTC/STC',
@@ -1099,7 +1587,7 @@ wss.on('connection', (ws)=>{
     availableEquities: EQUITY_SYMBOLS,
     conidMappings: initialMappings
   }));
-  
+
   ws.on('message', (m)=>{
     try{
       const d = JSON.parse(m.toString());
@@ -1128,1109 +1616,313 @@ wss.on('connection', (ws)=>{
       }
     }catch(e){}
   });
-  
+
   ws.on('close', ()=>clients.delete(ws));
 });
 
 app.get('/', (req,res)=>{
   res.setHeader('content-type','text/html; charset=utf-8');
   res.end(`<!doctype html>
-<html><head><title>IBKR Flow + Auto-Trade</title>
-<style>
-body{font-family:monospace;background:#0a0a0a;color:#0f0;margin:0;padding:16px}
-.row{border:1px solid #0f0;margin:10px 0;padding:10px}
-.equity{border-left:4px solid #ff00ff}
-.futures{border-left:4px solid #00ffff}
-.sweep{border-color:#ff0033;background:#1a0000}
-.block{border-color:#ffaa00;background:#1a0f00}
-.notable{border-color:#00ff00;background:#001a00}
-.bto,.btc{color:#00ff99;font-weight:bold}
-.sto,.stc{color:#ffaa55;font-weight:bold}
-.bull{color:#00ff00;font-weight:bold}
-.bear{color:#ff3333;font-weight:bold}
-.neutral{color:#ffff00}
-.q{font-size:12px;color:#9a9a9a}
-.print{font-size:12px;color:#0ff}
-.unknown{color:#ff5555}
-.auto-trade{border:2px solid #ffff00;background:#1a1a00}
-.position{border:2px solid #00ffff;background:#001a1a;padding:8px;margin:5px 0}
-.header{background:#1a1a1a;padding:10px;margin-bottom:10px;border:1px solid #333}
-.btn{padding:5px 10px;margin:5px;cursor:pointer;background:#333;color:#0f0;border:1px solid #0f0}
-.btn:hover{background:#0f0;color:#000}
-</style></head>
+<html>
+<head>
+  <title>IBKR Flow + Auto-Trade</title>
+  <style>
+    body{font-family:monospace;background:#0a0a0a;color:#0f0;margin:0;padding:16px}
+    .row{border:1px solid #0f0;margin:10px 0;padding:10px}
+    .equity{border-left:4px solid #ff00ff}
+    .futures{border-left:4px solid #00ffff}
+    .sweep{border-color:#ff0033;background:#1a0000}
+    .block{border-color:#ffaa00;background:#1a0f00}
+    .notable{border-color:#00ff00;background:#001a00}
+    .bto,.btc{color:#00ff99;font-weight:bold}
+    .sto,.stc{color:#ffaa55;font-weight:bold}
+    .bull{color:#00ff00;font-weight:bold}
+    .bear{color:#ff3333;font-weight:bold}
+    .neutral{color:#ffff00}
+    .q{font-size:12px;color:#9a9a9a}
+    .print{font-size:12px;color:#0ff}
+    .unknown{color:#ff5555}
+    .auto-trade{border:2px solid #ffff00;background:#1a1a00}
+    .position{border:2px solid #00ffff;background:#001a1a;padding:8px;margin:5px 0}
+    .header{background:#1a1a1a;padding:10px;margin-bottom:10px;border:1px solid #333}
+    .btn{padding:5px 10px;margin:5px;cursor:pointer;background:#333;color:#0f0;border:1px solid #0f0}
+    .btn:hover{background:#0f0;color:#000}
+  </style>
+</head>
 <body>
-<h2>🚀 IBKR Flow + Auto-Trade (Equities + Futures)</h2>
-<div class="header">
-  <div>WS: ws://localhost:${PORT}/ws | Auto-Trade: <span id="autoTradeStatus">...</span></div>
-  <div>
-    <button class="btn" onclick="toggleAutoTrade()">Toggle Auto-Trade</button>
-    <button class="btn" onclick="closeAllPositions()">Close All Positions</button>
-    <button class="btn" onclick="refreshStatus()">Refresh Status</button>
+  <h2>🚀 IBKR Flow + Auto-Trade (Equities + Futures)</h2>
+  <div class="header">
+    <div>WS: ws://localhost:${PORT}/ws | Auto-Trade: <span id="autoTradeStatus">...</span></div>
+    <div>
+      <button class="btn" onclick="toggleAutoTrade()">Toggle Auto-Trade</button>
+      <button class="btn" onclick="closeAllPositions()">Close All Positions</button>
+      <button class="btn" onclick="refreshStatus()">Refresh Status</button>
+    </div>
+    <div>Futures: /ES, /NQ | Equities: SPY, QQQ, AAPL, TSLA</div>
+    <div id="positions"></div>
   </div>
-  <div>Futures: /ES, /NQ | Equities: SPY, QQQ, AAPL, TSLA</div>
-  <div id="positions"></div>
-</div>
-<hr/>
-<div id="out"></div>
-<script>
-const out = document.getElementById('out');
-const positionsDiv = document.getElementById('positions');
-const ws = new WebSocket('ws://'+location.host+'/ws');
+  <hr/>
+  <div id="out"></div>
+  <script>
+    (function(){
+      var out = document.getElementById('out');
+      var positionsDiv = document.getElementById('positions');
+      var autoTradeEnabled = false;
+      var conidMappings = {};
 
-let conidMappings = {};
-let autoTradeEnabled = false;
+      var ws = new WebSocket('ws://' + location.host + '/ws');
 
-ws.onopen = () => {
-  ws.send(JSON.stringify({
-    action:'subscribe',
-    futuresSymbols:['/ES','/NQ'],
-    equitySymbols:['SPY','QQQ','AAPL','TSLA']
-  }));
-  console.log('Connected to IBKR Flow');
-  refreshStatus();
-};
+      ws.onopen = function(){
+        ws.send(JSON.stringify({
+          action:'subscribe',
+          futuresSymbols:['/ES','/NQ'],
+          equitySymbols:['SPY','QQQ','AAPL','TSLA']
+        }));
+        console.log('Connected to IBKR Flow');
+        refreshStatus();
+      };
 
-async function refreshStatus() {
-  const res = await fetch('/auto-trade/status');
-  const data = await res.json();
-  autoTradeEnabled = data.enabled;
-  document.getElementById('autoTradeStatus').innerHTML = 
-    data.enabled ? '<span style="color:#0f0">✅ ENABLED</span>' : '<span style="color:#f00">❌ DISABLED</span>';
-  
-  // Display positions
-  if (data.positions && data.positions.length > 0) {
-    positionsDiv.innerHTML = '<h3>Active Positions:</h3>' +
-      data.positions.filter(p => p.status === 'OPEN').map(p => {
-        const pnl = ((p.current - p.entry) / p.entry * 100).toFixed(1);
-        const color = parseFloat(pnl) >= 0 ? '#0f0' : '#f00';
-        return '<div class="position">' +
-          '<strong>' + p.symbol + ' ' + p.type + ' 
+      function getOptionDetails(conid) {
+        return conidMappings[conid] || {
+          symbol: 'UNKNOWN',
+          strike: 0,
+          right: 'U',
+          description: 'Unknown'
+        };
+      }
 
-/* --------------------------- Runner ----------------------------------- */
-(async () => {
-  console.log(`HTTP+WS @ :${PORT}  IBKR=${IBKR_HOST}/v1/api`);
-  
-  try {
-    await primeIB();
-    await setMarketDataLive();
-  } catch (e) {
-    console.error('[boot]', e?.response?.data || e.message || e);
-  }
-  
-  server.listen(PORT, () => console.log('[server] listening on :'+PORT));
-  
-  async function coordinatorLoop(){
-    while(true){
-      const futs = ['/ES','/NQ'];
-      const eqs = ['SPY','QQQ','AAPL','TSLA'];
-      
-      // Process futures
-      for (const f of futs) await loopFuturesSymbol(f);
-      
-      // Process equities
-      for (const s of eqs) await loopEquitySymbol(s);
-      
-      // Poll live quotes
-      await pollLiveQuotes();
-      
-      // Monitor auto-trade positions
-      await monitorPositions();
-      
-      await sleep(1500);
-    }
-  }
-  
-  coordinatorLoop().catch(e=>console.error('[coordinator]', e.message));
-})(); + p.strike + '</strong> | ' +
-          'Entry: 
+      function renderPositions(data) {
+        autoTradeEnabled = !!data.enabled;
+        document.getElementById('autoTradeStatus').innerHTML =
+          data.enabled
+            ? '<span style="color:#0f0">✅ ENABLED</span>'
+            : '<span style="color:#f00">❌ DISABLED</span>';
 
-/* --------------------------- Runner ----------------------------------- */
-(async () => {
-  console.log(`HTTP+WS @ :${PORT}  IBKR=${IBKR_HOST}/v1/api`);
-  
-  try {
-    await primeIB();
-    await setMarketDataLive();
-  } catch (e) {
-    console.error('[boot]', e?.response?.data || e.message || e);
-  }
-  
-  server.listen(PORT, () => console.log('[server] listening on :'+PORT));
-  
-  async function coordinatorLoop(){
-    while(true){
-      const futs = ['/ES','/NQ'];
-      const eqs = ['SPY','QQQ','AAPL','TSLA'];
-      
-      // Process futures
-      for (const f of futs) await loopFuturesSymbol(f);
-      
-      // Process equities
-      for (const s of eqs) await loopEquitySymbol(s);
-      
-      // Poll live quotes
-      await pollLiveQuotes();
-      
-      // Monitor auto-trade positions
-      await monitorPositions();
-      
-      await sleep(1500);
-    }
-  }
-  
-  coordinatorLoop().catch(e=>console.error('[coordinator]', e.message));
-})(); + p.entry.toFixed(2) + ' | Current: 
+        var html = '';
+        var openPositions = (data.positions || []).filter(function(p){ return p.status === 'OPEN'; });
 
-/* --------------------------- Runner ----------------------------------- */
-(async () => {
-  console.log(`HTTP+WS @ :${PORT}  IBKR=${IBKR_HOST}/v1/api`);
-  
-  try {
-    await primeIB();
-    await setMarketDataLive();
-  } catch (e) {
-    console.error('[boot]', e?.response?.data || e.message || e);
-  }
-  
-  server.listen(PORT, () => console.log('[server] listening on :'+PORT));
-  
-  async function coordinatorLoop(){
-    while(true){
-      const futs = ['/ES','/NQ'];
-      const eqs = ['SPY','QQQ','AAPL','TSLA'];
-      
-      // Process futures
-      for (const f of futs) await loopFuturesSymbol(f);
-      
-      // Process equities
-      for (const s of eqs) await loopEquitySymbol(s);
-      
-      // Poll live quotes
-      await pollLiveQuotes();
-      
-      // Monitor auto-trade positions
-      await monitorPositions();
-      
-      await sleep(1500);
-    }
-  }
-  
-  coordinatorLoop().catch(e=>console.error('[coordinator]', e.message));
-})(); + p.current.toFixed(2) + ' | ' +
-          '<span style="color:' + color + '">P&L: ' + pnl + '%</span> | ' +
-          'Target: 
+        if (openPositions.length) {
+          html += '<h3>Active Positions:</h3>';
+          openPositions.forEach(function(p){
+            var pnlPct = ((p.current - p.entry) / p.entry * 100).toFixed(1);
+            var color = parseFloat(pnlPct) >= 0 ? '#0f0' : '#f00';
+            html += '<div class="position">' +
+              '<strong>' + p.symbol + ' ' + (p.type || '') + (isNaN(p.strike) ? '' : (' ' + p.strike)) + '</strong> | ' +
+              'Entry: ' + (p.entry != null ? p.entry.toFixed(2) : '-') + ' | ' +
+              'Current: ' + (p.current != null ? p.current.toFixed(2) : '-') + ' | ' +
+              '<span style="color:' + color + '">P&L: ' + pnlPct + '%</span>' +
+              '</div>';
+          });
+        } else {
+          html += '<div>No active positions</div>';
+        }
 
-/* --------------------------- Runner ----------------------------------- */
-(async () => {
-  console.log(`HTTP+WS @ :${PORT}  IBKR=${IBKR_HOST}/v1/api`);
-  
-  try {
-    await primeIB();
-    await setMarketDataLive();
-  } catch (e) {
-    console.error('[boot]', e?.response?.data || e.message || e);
-  }
-  
-  server.listen(PORT, () => console.log('[server] listening on :'+PORT));
-  
-  async function coordinatorLoop(){
-    while(true){
-      const futs = ['/ES','/NQ'];
-      const eqs = ['SPY','QQQ','AAPL','TSLA'];
-      
-      // Process futures
-      for (const f of futs) await loopFuturesSymbol(f);
-      
-      // Process equities
-      for (const s of eqs) await loopEquitySymbol(s);
-      
-      // Poll live quotes
-      await pollLiveQuotes();
-      
-      // Monitor auto-trade positions
-      await monitorPositions();
-      
-      await sleep(1500);
-    }
-  }
-  
-  coordinatorLoop().catch(e=>console.error('[coordinator]', e.message));
-})(); + p.profitTarget.toFixed(2) + ' | Stop: 
+        // Signals summary
+        if (data.signals) {
+          html += '<h3>Recent Signals (5min window):</h3>';
+          Object.keys(data.signals).forEach(function(sym){
+            var sig = data.signals[sym];
+            var stanceColor = sig.avgStance > 30 ? '#0f0' : (sig.avgStance < -30 ? '#f00' : '#ff0');
+            html += '<div style="display:inline-block;margin:5px;padding:5px;border:1px solid #333">' +
+              '<strong>' + sym + '</strong>: ' + sig.count + ' signals | ' +
+              '<span style="color:' + stanceColor + '">Stance: ' + sig.avgStance.toFixed(0) + '</span> | ' +
+              '🟢' + sig.bullish + ' 🔴' + sig.bearish +
+              '</div>';
+          });
+        }
 
-/* --------------------------- Runner ----------------------------------- */
-(async () => {
-  console.log(`HTTP+WS @ :${PORT}  IBKR=${IBKR_HOST}/v1/api`);
-  
-  try {
-    await primeIB();
-    await setMarketDataLive();
-  } catch (e) {
-    console.error('[boot]', e?.response?.data || e.message || e);
-  }
-  
-  server.listen(PORT, () => console.log('[server] listening on :'+PORT));
-  
-  async function coordinatorLoop(){
-    while(true){
-      const futs = ['/ES','/NQ'];
-      const eqs = ['SPY','QQQ','AAPL','TSLA'];
-      
-      // Process futures
-      for (const f of futs) await loopFuturesSymbol(f);
-      
-      // Process equities
-      for (const s of eqs) await loopEquitySymbol(s);
-      
-      // Poll live quotes
-      await pollLiveQuotes();
-      
-      // Monitor auto-trade positions
-      await monitorPositions();
-      
-      await sleep(1500);
-    }
-  }
-  
-  coordinatorLoop().catch(e=>console.error('[coordinator]', e.message));
-})(); + p.stopLoss.toFixed(2) +
+        positionsDiv.innerHTML = html;
+      }
+
+      window.refreshStatus = function(){
+        fetch('/auto-trade/status')
+          .then(function(r){ return r.json(); })
+          .then(renderPositions)
+          .catch(function(e){ console.error('status error', e); });
+      };
+
+      window.toggleAutoTrade = function(){
+        var endpoint = autoTradeEnabled ? '/auto-trade/disable' : '/auto-trade/enable';
+        fetch(endpoint, { method:'POST' })
+          .then(function(){ refreshStatus(); });
+      };
+
+      window.closeAllPositions = function(){
+        if (!confirm('Close all open positions?')) return;
+        fetch('/auto-trade/close-all', { method:'POST' })
+          .then(function(){ refreshStatus(); });
+      };
+
+      function rowTrade(d){
+        var classes = (d.classifications||[]).map(function(x){return x.toLowerCase();}).join(' ');
+        var ac = d.assetClass==='FUTURES_OPTION'?'futures':'equity';
+        var dir = (d.direction||'').toLowerCase();
+        var hist = d.historicalComparison||{};
+        var g = d.greeks||{delta:0};
+        var details = getOptionDetails(d.conid);
+        var symbolDisplay = details.symbol === 'UNKNOWN'
+          ? '<span class="unknown">conid '+d.conid+'</span>'
+          : details.symbol;
+        var strikeDisplay = details.strike ? ' ' + details.strike : '';
+        var rightDisplay = details.right && details.right !== 'U' ? ' ' + details.right : '';
+
+        var stanceClass = d.stanceLabel === 'BULL' ? 'bull' : (d.stanceLabel === 'BEAR' ? 'bear' : 'neutral');
+        var stanceDisplay = d.stanceLabel
+          ? '<span class="' + stanceClass + '">' + d.stanceLabel + ' ' + (d.stanceScore||'') + '</span>'
+          : '';
+
+        var html = '';
+        html += '<div class="row ' + classes + ' ' + ac + '" id="t-' + d.conid + '">';
+        html += '<div><span class="' + dir + '">' + d.direction + '</span> ' + d.confidence + '% | ' + stanceDisplay + ' | ';
+        html += '<b>' + symbolDisplay + rightDisplay + strikeDisplay + '</b> ' + (d.expiry || '') + ' |';
+        html += ' size ' + d.size + ' prem ' + (d.premium || 0).toFixed(0) + ' |';
+        html += ' vol/OI ' + ((d.volOiRatio||0)).toFixed(2) + '</div>';
+        html += '<div class="q" id="q-' + d.conid + '">';
+        html += 'UL ' + (d.underlyingPrice || 0).toFixed(2) + ' | OPT ' + (d.optionPrice || 0).toFixed(2);
+        html += ' | bid ' + (d.bid || 0).toFixed(2) + ' ask ' + (d.ask || 0).toFixed(2) + ' | Δ ' + ((g.delta||0)).toFixed(3);
+        html += '</div>';
+        html += '<div class="q">hist: avgOI ' + (hist.avgOI||'-') +
+          ' | avgVol ' + (hist.avgVolume||'-') +
+          ' | OIΔ ' + (hist.oiChange||'-') +
+          ' | Vol× ' + (hist.volumeMultiple||'-') +
+          ' | days ' + (hist.dataPoints||0) + '</div>';
+        html += '</div>';
+        return html;
+      }
+
+      function rowPrint(p){
+        var details = getOptionDetails(p.conid);
+        var symbolDisplay = details.symbol === 'UNKNOWN'
+          ? '<span class="unknown">conid '+p.conid+'</span>'
+          : details.symbol;
+        var strikeDisplay = details.strike ? ' ' + details.strike : '';
+
+        var stanceClass = p.stance === 'BULL' ? 'bull' : (p.stance === 'BEAR' ? 'bear' : 'neutral');
+        var stanceDisplay = p.stance
+          ? ' | <span class="' + stanceClass + '">' + p.stance + ' ' + (p.stanceScore||'') + '</span>'
+          : '';
+
+        var html = '';
+        html += '<div class="row print">';
+        html += 'PRINT ' + symbolDisplay + ' ' + p.right + strikeDisplay + ' ' + (p.expiry||'') + ' |';
+        html += ' size ' + p.tradeSize + ' @ ' + p.tradePrice.toFixed(2) + ' prem ' + p.premium.toFixed(0) + ' |';
+        html += ' vol/OI ' + ((p.volOiRatio||0)).toFixed(2) + ' | ' + (p.aggressor?'BUY-agg':'SELL-agg');
+        html += stanceDisplay;
+        html += '</div>';
+        return html;
+      }
+
+      function updateQuote(d) {
+        var el = document.getElementById('q-'+d.conid);
+        if(!el) return;
+        var details = getOptionDetails(d.conid);
+
+        if(d.type==='LIVE_QUOTE'){
+          var displayText;
+          if (details.symbol === 'UNKNOWN') {
+            displayText = '<span class="unknown">conid '+d.conid+'</span> | OPT ' + d.last.toFixed(2) + ' | Δ ' + d.delta.toFixed(3);
+          } else {
+            var rightDisplay = details.right === 'C' ? 'CALL' : (details.right === 'P' ? 'PUT' : '');
+            displayText = details.symbol + ' ' + rightDisplay + ' ' + (details.strike||'') +
+              ' | OPT ' + d.last.toFixed(2) + ' | Δ ' + d.delta.toFixed(3);
+          }
+          el.innerHTML = displayText + ' | vol ' + d.volume + ' | ' + new Date(d.timestamp).toLocaleTimeString();
+        } else if(d.type==='UL_LIVE_QUOTE') {
+          var sym;
+          if (details.symbol === 'UNKNOWN') {
+            sym = '<span class="unknown">conid '+d.conid+'</span>';
+          } else {
+            sym = details.symbol + (details.type === 'UNDERLYING' ? ' UL' : '');
+          }
+          el.innerHTML = sym + ' | last ' + d.last.toFixed(2) + ' | vol ' + d.volume + ' | ' + new Date(d.timestamp).toLocaleTimeString();
+        }
+      }
+
+      ws.onmessage = function(e){
+        var d = JSON.parse(e.data);
+
+        if(d.type==='connected' && d.conidMappings){
+          Object.keys(d.conidMappings).forEach(function(k){
+            conidMappings[k] = d.conidMappings[k];
+          });
+          console.log('Loaded', Object.keys(d.conidMappings).length, 'conid mappings');
+        } else if(d.type==='CONID_MAPPING'){
+          conidMappings[d.conid] = d.mapping;
+        } else if(d.type==='TRADE'){
+          var div=document.createElement('div');
+          div.innerHTML=rowTrade(d);
+          out.insertBefore(div.firstElementChild,out.firstChild);
+          while(out.children.length>80) out.removeChild(out.lastChild);
+        } else if(d.type==='PRINT'){
+          var div=document.createElement('div');
+          div.innerHTML=rowPrint(d);
+          out.insertBefore(div.firstElementChild,out.firstChild);
+          while(out.children.length>80) out.removeChild(out.lastChild);
+        } else if(d.type==='LIVE_QUOTE' || d.type==='UL_LIVE_QUOTE'){
+          updateQuote(d);
+        } else if(d.type==='AUTO_TRADE_EXECUTED'){
+          var pnlDiv=document.createElement('div');
+          pnlDiv.innerHTML = '<div class="row auto-trade">' +
+            '🎯 AUTO-TRADE EXECUTED: ' + d.side + ' ' + d.symbol + ' | ' +
+            'Contracts: ' + d.contracts + ' @ ' + d.entry.toFixed(2) + ' | ' +
+            'Target: ' + d.profitTarget.toFixed(2) + ' | Stop: ' + d.stopLoss.toFixed(2) +
+            '<br/><small>Reasoning: ' + (d.reasoning || []).join(', ') + '</small>' +
           '</div>';
-      }).join('');
-  } else {
-    positionsDiv.innerHTML = '<div>No active positions</div>';
-  }
-  
-  // Display signals
-  if (data.signals) {
-    const signalsHtml = Object.entries(data.signals).map(([sym, sig]) => {
-      const stanceColor = sig.avgStance > 30 ? '#0f0' : sig.avgStance < -30 ? '#f00' : '#ff0';
-      return '<div style="display:inline-block;margin:5px;padding:5px;border:1px solid #333">' +
-        '<strong>' + sym + '</strong>: ' + sig.count + ' signals | ' +
-        '<span style="color:' + stanceColor + '">Stance: ' + sig.avgStance.toFixed(0) + '</span> | ' +
-        '🟢' + sig.bullish + ' 🔴' + sig.bearish +
-        '</div>';
-    }).join('');
-    
-    if (!positionsDiv.innerHTML.includes('Signals:')) {
-      positionsDiv.innerHTML += '<h3>Recent Signals (5min window):</h3>' + signalsHtml;
-    }
-  }
-}
+          out.insertBefore(pnlDiv.firstElementChild,out.firstChild);
+          refreshStatus();
+        } else if(d.type==='AUTO_TRADE_CLOSED'){
+          var divClose=document.createElement('div');
+          var pnlColor = parseFloat(d.pnl) >= 0 ? '#0f0' : '#f00';
+          divClose.innerHTML = '<div class="row auto-trade">' +
+            '🔄 POSITION CLOSED: ' + d.symbol + ' | ' +
+            '<span style="color:' + pnlColor + '">P&L: ' + d.pnl + ' (' + d.dollarPnl + ')</span> | ' +
+            'Reason: ' + d.reason +
+          '</div>';
+          out.insertBefore(divClose.firstElementChild,out.firstChild);
+          refreshStatus();
+        }
+      };
 
-async function toggleAutoTrade() {
-  const endpoint = autoTradeEnabled ? '/auto-trade/disable' : '/auto-trade/enable';
-  await fetch(endpoint, { method: 'POST' });
-  refreshStatus();
-}
+      setInterval(function(){
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({action: 'get_mappings'}));
+        }
+      }, 30000);
 
-async function closeAllPositions() {
-  if (!confirm('Close all open positions?')) return;
-  await fetch('/auto-trade/close-all', { method: 'POST' });
-  refreshStatus();
-}
-
-setInterval(refreshStatus, 5000); // Refresh every 5 seconds
-
-function getOptionDetails(conid) {
-  return conidMappings[conid] || {
-    symbol: 'UNKNOWN',
-    strike: 0,
-    right: 'U',
-    description: 'Unknown'
-  };
-}
-
-function rowTrade(d){
-  const classes = (d.classifications||[]).map(x=>x.toLowerCase()).join(' ');
-  const ac = d.assetClass==='FUTURES_OPTION'?'futures':'equity';
-  const dir=(d.direction||'').toLowerCase();
-  const hist=d.historicalComparison||{};
-  const g=d.greeks||{delta:0};
-  const details = getOptionDetails(d.conid);
-  const symbolDisplay = details.symbol === 'UNKNOWN' 
-    ? '<span class="unknown">conid '+d.conid+'</span>' 
-    : details.symbol;
-  const strikeDisplay = details.strike > 0 ? '
-
-/* --------------------------- Runner ----------------------------------- */
-(async () => {
-  console.log(`HTTP+WS @ :${PORT}  IBKR=${IBKR_HOST}/v1/api`);
-  
-  try {
-    await primeIB();
-    await setMarketDataLive();
-  } catch (e) {
-    console.error('[boot]', e?.response?.data || e.message || e);
-  }
-  
-  server.listen(PORT, () => console.log('[server] listening on :'+PORT));
-  
-  async function coordinatorLoop(){
-    while(true){
-      const futs = ['/ES','/NQ'];
-      const eqs = ['SPY','QQQ','AAPL','TSLA'];
-      
-      // Process futures
-      for (const f of futs) await loopFuturesSymbol(f);
-      
-      // Process equities
-      for (const s of eqs) await loopEquitySymbol(s);
-      
-      // Poll live quotes
-      await pollLiveQuotes();
-      
-      // Monitor auto-trade positions
-      await monitorPositions();
-      
-      await sleep(1500);
-    }
-  }
-  
-  coordinatorLoop().catch(e=>console.error('[coordinator]', e.message));
-})();+details.strike : '';
-  const rightDisplay = details.right !== 'U' ? details.right : '';
-  
-  // Stance display
-  const stanceClass = d.stanceLabel === 'BULL' ? 'bull' : d.stanceLabel === 'BEAR' ? 'bear' : 'neutral';
-  const stanceDisplay = d.stanceLabel ? 
-    '<span class="' + stanceClass + '">' + d.stanceLabel + ' ' + d.stanceScore + '</span>' : '';
-  
-  return '<div class="row '+classes+' '+ac+'" id="t-'+d.conid+'">'+
-    '<div><span class="'+dir+'">'+d.direction+'</span> '+d.confidence+'% | ' + stanceDisplay + ' | '+
-    '<b> '+symbolDisplay+' '+rightDisplay+' '+strikeDisplay+'</b> '+(d.expiry||'')+' |'+
-    ' size '+d.size+' prem 
-
-/* --------------------------- Runner ----------------------------------- */
-(async () => {
-  console.log(`HTTP+WS @ :${PORT}  IBKR=${IBKR_HOST}/v1/api`);
-  
-  try {
-    await primeIB();
-    await setMarketDataLive();
-  } catch (e) {
-    console.error('[boot]', e?.response?.data || e.message || e);
-  }
-  
-  server.listen(PORT, () => console.log('[server] listening on :'+PORT));
-  
-  async function coordinatorLoop(){
-    while(true){
-      const futs = ['/ES','/NQ'];
-      const eqs = ['SPY','QQQ','AAPL','TSLA'];
-      
-      // Process futures
-      for (const f of futs) await loopFuturesSymbol(f);
-      
-      // Process equities
-      for (const s of eqs) await loopEquitySymbol(s);
-      
-      // Poll live quotes
-      await pollLiveQuotes();
-      
-      // Monitor auto-trade positions
-      await monitorPositions();
-      
-      await sleep(1500);
-    }
-  }
-  
-  coordinatorLoop().catch(e=>console.error('[coordinator]', e.message));
-})();+(d.premium||0).toFixed(0)+' |'+
-    ' vol/OI '+((d.volOiRatio||0)).toFixed(2)+'</div>'+
-    '<div class="q" id="q-'+d.conid+'">'+
-    'UL 
-
-/* --------------------------- Runner ----------------------------------- */
-(async () => {
-  console.log(`HTTP+WS @ :${PORT}  IBKR=${IBKR_HOST}/v1/api`);
-  
-  try {
-    await primeIB();
-    await setMarketDataLive();
-  } catch (e) {
-    console.error('[boot]', e?.response?.data || e.message || e);
-  }
-  
-  server.listen(PORT, () => console.log('[server] listening on :'+PORT));
-  
-  async function coordinatorLoop(){
-    while(true){
-      const futs = ['/ES','/NQ'];
-      const eqs = ['SPY','QQQ','AAPL','TSLA'];
-      
-      // Process futures
-      for (const f of futs) await loopFuturesSymbol(f);
-      
-      // Process equities
-      for (const s of eqs) await loopEquitySymbol(s);
-      
-      // Poll live quotes
-      await pollLiveQuotes();
-      
-      // Monitor auto-trade positions
-      await monitorPositions();
-      
-      await sleep(1500);
-    }
-  }
-  
-  coordinatorLoop().catch(e=>console.error('[coordinator]', e.message));
-})();+(d.underlyingPrice||0).toFixed(2)+' | OPT 
-
-/* --------------------------- Runner ----------------------------------- */
-(async () => {
-  console.log(`HTTP+WS @ :${PORT}  IBKR=${IBKR_HOST}/v1/api`);
-  
-  try {
-    await primeIB();
-    await setMarketDataLive();
-  } catch (e) {
-    console.error('[boot]', e?.response?.data || e.message || e);
-  }
-  
-  server.listen(PORT, () => console.log('[server] listening on :'+PORT));
-  
-  async function coordinatorLoop(){
-    while(true){
-      const futs = ['/ES','/NQ'];
-      const eqs = ['SPY','QQQ','AAPL','TSLA'];
-      
-      // Process futures
-      for (const f of futs) await loopFuturesSymbol(f);
-      
-      // Process equities
-      for (const s of eqs) await loopEquitySymbol(s);
-      
-      // Poll live quotes
-      await pollLiveQuotes();
-      
-      // Monitor auto-trade positions
-      await monitorPositions();
-      
-      await sleep(1500);
-    }
-  }
-  
-  coordinatorLoop().catch(e=>console.error('[coordinator]', e.message));
-})();+(d.optionPrice||0).toFixed(2)+
-    ' | bid 
-
-/* --------------------------- Runner ----------------------------------- */
-(async () => {
-  console.log(`HTTP+WS @ :${PORT}  IBKR=${IBKR_HOST}/v1/api`);
-  
-  try {
-    await primeIB();
-    await setMarketDataLive();
-  } catch (e) {
-    console.error('[boot]', e?.response?.data || e.message || e);
-  }
-  
-  server.listen(PORT, () => console.log('[server] listening on :'+PORT));
-  
-  async function coordinatorLoop(){
-    while(true){
-      const futs = ['/ES','/NQ'];
-      const eqs = ['SPY','QQQ','AAPL','TSLA'];
-      
-      // Process futures
-      for (const f of futs) await loopFuturesSymbol(f);
-      
-      // Process equities
-      for (const s of eqs) await loopEquitySymbol(s);
-      
-      // Poll live quotes
-      await pollLiveQuotes();
-      
-      // Monitor auto-trade positions
-      await monitorPositions();
-      
-      await sleep(1500);
-    }
-  }
-  
-  coordinatorLoop().catch(e=>console.error('[coordinator]', e.message));
-})();+(d.bid||0).toFixed(2)+' ask 
-
-/* --------------------------- Runner ----------------------------------- */
-(async () => {
-  console.log(`HTTP+WS @ :${PORT}  IBKR=${IBKR_HOST}/v1/api`);
-  
-  try {
-    await primeIB();
-    await setMarketDataLive();
-  } catch (e) {
-    console.error('[boot]', e?.response?.data || e.message || e);
-  }
-  
-  server.listen(PORT, () => console.log('[server] listening on :'+PORT));
-  
-  async function coordinatorLoop(){
-    while(true){
-      const futs = ['/ES','/NQ'];
-      const eqs = ['SPY','QQQ','AAPL','TSLA'];
-      
-      // Process futures
-      for (const f of futs) await loopFuturesSymbol(f);
-      
-      // Process equities
-      for (const s of eqs) await loopEquitySymbol(s);
-      
-      // Poll live quotes
-      await pollLiveQuotes();
-      
-      // Monitor auto-trade positions
-      await monitorPositions();
-      
-      await sleep(1500);
-    }
-  }
-  
-  coordinatorLoop().catch(e=>console.error('[coordinator]', e.message));
-})();+(d.ask||0).toFixed(2)+' | Δ '+((g.delta||0)).toFixed(3)+
-    '</div>'+
-    '<div class="q">hist: avgOI '+(hist.avgOI||'-')+' | avgVol '+(hist.avgVolume||'-')+
-    ' | OIΔ '+(hist.oiChange||'-')+' | Vol× '+(hist.volumeMultiple||'-')+' | days '+(hist.dataPoints||0)+'</div>'+
-    '</div>';
-}
-
-function rowPrint(p){
-  const details = getOptionDetails(p.conid);
-  const symbolDisplay = details.symbol === 'UNKNOWN' 
-    ? '<span class="unknown">conid '+p.conid+'</span>' 
-    : details.symbol;
-  const strikeDisplay = details.strike > 0 ? '
-
-/* --------------------------- Runner ----------------------------------- */
-(async () => {
-  console.log(`HTTP+WS @ :${PORT}  IBKR=${IBKR_HOST}/v1/api`);
-  
-  try {
-    await primeIB();
-    await setMarketDataLive();
-  } catch (e) {
-    console.error('[boot]', e?.response?.data || e.message || e);
-  }
-  
-  server.listen(PORT, () => console.log('[server] listening on :'+PORT));
-  
-  async function coordinatorLoop(){
-    while(true){
-      const futs = ['/ES','/NQ'];
-      const eqs = ['SPY','QQQ','AAPL','TSLA'];
-      
-      // Process futures
-      for (const f of futs) await loopFuturesSymbol(f);
-      
-      // Process equities
-      for (const s of eqs) await loopEquitySymbol(s);
-      
-      // Poll live quotes
-      await pollLiveQuotes();
-      
-      // Monitor auto-trade positions
-      await monitorPositions();
-      
-      await sleep(1500);
-    }
-  }
-  
-  coordinatorLoop().catch(e=>console.error('[coordinator]', e.message));
-})();+details.strike : '';
-  
-  // Stance display for prints
-  const stanceClass = p.stance === 'BULL' ? 'bull' : p.stance === 'BEAR' ? 'bear' : 'neutral';
-  const stanceDisplay = p.stance ? 
-    ' | <span class="' + stanceClass + '">' + p.stance + ' ' + p.stanceScore + '</span>' : '';
-  
-  return '<div class="row print">'+
-    'PRINT '+symbolDisplay+' '+p.right+' '+strikeDisplay+' '+(p.expiry||'')+' |'+
-    ' size '+p.tradeSize+' @ 
-
-/* --------------------------- Runner ----------------------------------- */
-(async () => {
-  console.log(`HTTP+WS @ :${PORT}  IBKR=${IBKR_HOST}/v1/api`);
-  
-  try {
-    await primeIB();
-    await setMarketDataLive();
-  } catch (e) {
-    console.error('[boot]', e?.response?.data || e.message || e);
-  }
-  
-  server.listen(PORT, () => console.log('[server] listening on :'+PORT));
-  
-  async function coordinatorLoop(){
-    while(true){
-      const futs = ['/ES','/NQ'];
-      const eqs = ['SPY','QQQ','AAPL','TSLA'];
-      
-      // Process futures
-      for (const f of futs) await loopFuturesSymbol(f);
-      
-      // Process equities
-      for (const s of eqs) await loopEquitySymbol(s);
-      
-      // Poll live quotes
-      await pollLiveQuotes();
-      
-      // Monitor auto-trade positions
-      await monitorPositions();
-      
-      await sleep(1500);
-    }
-  }
-  
-  coordinatorLoop().catch(e=>console.error('[coordinator]', e.message));
-})();+p.tradePrice.toFixed(2)+' prem 
-
-/* --------------------------- Runner ----------------------------------- */
-(async () => {
-  console.log(`HTTP+WS @ :${PORT}  IBKR=${IBKR_HOST}/v1/api`);
-  
-  try {
-    await primeIB();
-    await setMarketDataLive();
-  } catch (e) {
-    console.error('[boot]', e?.response?.data || e.message || e);
-  }
-  
-  server.listen(PORT, () => console.log('[server] listening on :'+PORT));
-  
-  async function coordinatorLoop(){
-    while(true){
-      const futs = ['/ES','/NQ'];
-      const eqs = ['SPY','QQQ','AAPL','TSLA'];
-      
-      // Process futures
-      for (const f of futs) await loopFuturesSymbol(f);
-      
-      // Process equities
-      for (const s of eqs) await loopEquitySymbol(s);
-      
-      // Poll live quotes
-      await pollLiveQuotes();
-      
-      // Monitor auto-trade positions
-      await monitorPositions();
-      
-      await sleep(1500);
-    }
-  }
-  
-  coordinatorLoop().catch(e=>console.error('[coordinator]', e.message));
-})();+p.premium.toFixed(0)+' |'+
-    ' vol/OI '+((p.volOiRatio||0)).toFixed(2)+' | '+(p.aggressor?'BUY-agg':'SELL-agg')+
-    stanceDisplay +
-    '</div>';
-}
-
-function updateQuote(d) {
-  const el = document.getElementById('q-'+d.conid);
-  if(!el) return;
-  const details = getOptionDetails(d.conid);
-  
-  if(d.type==='LIVE_QUOTE'){
-    let displayText;
-    if (details.symbol === 'UNKNOWN') {
-      displayText = '<span class="unknown">conid '+d.conid+'</span> | OPT 
-
-/* --------------------------- Runner ----------------------------------- */
-(async () => {
-  console.log(`HTTP+WS @ :${PORT}  IBKR=${IBKR_HOST}/v1/api`);
-  
-  try {
-    await primeIB();
-    await setMarketDataLive();
-  } catch (e) {
-    console.error('[boot]', e?.response?.data || e.message || e);
-  }
-  
-  server.listen(PORT, () => console.log('[server] listening on :'+PORT));
-  
-  async function coordinatorLoop(){
-    while(true){
-      const futs = ['/ES','/NQ'];
-      const eqs = ['SPY','QQQ','AAPL','TSLA'];
-      
-      // Process futures
-      for (const f of futs) await loopFuturesSymbol(f);
-      
-      // Process equities
-      for (const s of eqs) await loopEquitySymbol(s);
-      
-      // Poll live quotes
-      await pollLiveQuotes();
-      
-      // Monitor auto-trade positions
-      await monitorPositions();
-      
-      await sleep(1500);
-    }
-  }
-  
-  coordinatorLoop().catch(e=>console.error('[coordinator]', e.message));
-})();+d.last.toFixed(2)+' | Δ '+d.delta.toFixed(3);
-    } else {
-      const rightDisplay = details.right === 'C' ? 'CALL' : (details.right === 'P' ? 'PUT' : '');
-      displayText = details.symbol+' '+rightDisplay+' 
-
-/* --------------------------- Runner ----------------------------------- */
-(async () => {
-  console.log(`HTTP+WS @ :${PORT}  IBKR=${IBKR_HOST}/v1/api`);
-  
-  try {
-    await primeIB();
-    await setMarketDataLive();
-  } catch (e) {
-    console.error('[boot]', e?.response?.data || e.message || e);
-  }
-  
-  server.listen(PORT, () => console.log('[server] listening on :'+PORT));
-  
-  async function coordinatorLoop(){
-    while(true){
-      const futs = ['/ES','/NQ'];
-      const eqs = ['SPY','QQQ','AAPL','TSLA'];
-      
-      // Process futures
-      for (const f of futs) await loopFuturesSymbol(f);
-      
-      // Process equities
-      for (const s of eqs) await loopEquitySymbol(s);
-      
-      // Poll live quotes
-      await pollLiveQuotes();
-      
-      // Monitor auto-trade positions
-      await monitorPositions();
-      
-      await sleep(1500);
-    }
-  }
-  
-  coordinatorLoop().catch(e=>console.error('[coordinator]', e.message));
-})();+details.strike+' | OPT 
-
-/* --------------------------- Runner ----------------------------------- */
-(async () => {
-  console.log(`HTTP+WS @ :${PORT}  IBKR=${IBKR_HOST}/v1/api`);
-  
-  try {
-    await primeIB();
-    await setMarketDataLive();
-  } catch (e) {
-    console.error('[boot]', e?.response?.data || e.message || e);
-  }
-  
-  server.listen(PORT, () => console.log('[server] listening on :'+PORT));
-  
-  async function coordinatorLoop(){
-    while(true){
-      const futs = ['/ES','/NQ'];
-      const eqs = ['SPY','QQQ','AAPL','TSLA'];
-      
-      // Process futures
-      for (const f of futs) await loopFuturesSymbol(f);
-      
-      // Process equities
-      for (const s of eqs) await loopEquitySymbol(s);
-      
-      // Poll live quotes
-      await pollLiveQuotes();
-      
-      // Monitor auto-trade positions
-      await monitorPositions();
-      
-      await sleep(1500);
-    }
-  }
-  
-  coordinatorLoop().catch(e=>console.error('[coordinator]', e.message));
-})();+d.last.toFixed(2)+' | Δ '+d.delta.toFixed(3);
-    }
-    el.innerHTML = displayText+' | vol '+d.volume+' | '+new Date(d.timestamp).toLocaleTimeString();
-  } else if(d.type==='UL_LIVE_QUOTE') {
-    const ulDetails = getOptionDetails(d.conid);
-    let symbolDisplay;
-    if (ulDetails.symbol === 'UNKNOWN') {
-      symbolDisplay = '<span class="unknown">conid '+d.conid+'</span>';
-    } else {
-      symbolDisplay = ulDetails.symbol + (ulDetails.type === 'UNDERLYING' ? ' UL' : '');
-    }
-    el.innerHTML = symbolDisplay+' | last 
-
-/* --------------------------- Runner ----------------------------------- */
-(async () => {
-  console.log(`HTTP+WS @ :${PORT}  IBKR=${IBKR_HOST}/v1/api`);
-  
-  try {
-    await primeIB();
-    await setMarketDataLive();
-  } catch (e) {
-    console.error('[boot]', e?.response?.data || e.message || e);
-  }
-  
-  server.listen(PORT, () => console.log('[server] listening on :'+PORT));
-  
-  async function coordinatorLoop(){
-    while(true){
-      const futs = ['/ES','/NQ'];
-      const eqs = ['SPY','QQQ','AAPL','TSLA'];
-      
-      // Process futures
-      for (const f of futs) await loopFuturesSymbol(f);
-      
-      // Process equities
-      for (const s of eqs) await loopEquitySymbol(s);
-      
-      // Poll live quotes
-      await pollLiveQuotes();
-      
-      // Monitor auto-trade positions
-      await monitorPositions();
-      
-      await sleep(1500);
-    }
-  }
-  
-  coordinatorLoop().catch(e=>console.error('[coordinator]', e.message));
-})();+d.last.toFixed(2)+' | vol '+d.volume+' | '+new Date(d.timestamp).toLocaleTimeString();
-  }
-}
-
-ws.onmessage=(e)=>{
-  const d=JSON.parse(e.data);
-  
-  if(d.type==='connected' && d.conidMappings){
-    conidMappings = { ...conidMappings, ...d.conidMappings };
-    console.log('Loaded', Object.keys(d.conidMappings).length, 'conid mappings');
-  } else if(d.type==='CONID_MAPPING'){
-    conidMappings[d.conid] = d.mapping;
-  } else if(d.type==='TRADE'){
-    const div=document.createElement('div');
-    div.innerHTML=rowTrade(d);
-    out.insertBefore(div.firstElementChild,out.firstChild);
-    while(out.children.length>80) out.removeChild(out.lastChild);
-  } else if(d.type==='PRINT'){
-    const div=document.createElement('div');
-    div.innerHTML=rowPrint(d);
-    out.insertBefore(div.firstElementChild,out.firstChild);
-    while(out.children.length>80) out.removeChild(out.lastChild);
-  } else if(d.type==='LIVE_QUOTE' || d.type==='UL_LIVE_QUOTE'){
-    updateQuote(d);
-  } else if(d.type==='AUTO_TRADE_EXECUTED'){
-    const div=document.createElement('div');
-    div.innerHTML = '<div class="row auto-trade">'+
-      '🎯 AUTO-TRADE EXECUTED: ' + d.side + ' ' + d.symbol + ' | ' +
-      'Contracts: ' + d.contracts + ' @ 
-
-/* --------------------------- Runner ----------------------------------- */
-(async () => {
-  console.log(`HTTP+WS @ :${PORT}  IBKR=${IBKR_HOST}/v1/api`);
-  
-  try {
-    await primeIB();
-    await setMarketDataLive();
-  } catch (e) {
-    console.error('[boot]', e?.response?.data || e.message || e);
-  }
-  
-  server.listen(PORT, () => console.log('[server] listening on :'+PORT));
-  
-  async function coordinatorLoop(){
-    while(true){
-      const futs = ['/ES','/NQ'];
-      const eqs = ['SPY','QQQ','AAPL','TSLA'];
-      
-      // Process futures
-      for (const f of futs) await loopFuturesSymbol(f);
-      
-      // Process equities
-      for (const s of eqs) await loopEquitySymbol(s);
-      
-      // Poll live quotes
-      await pollLiveQuotes();
-      
-      // Monitor auto-trade positions
-      await monitorPositions();
-      
-      await sleep(1500);
-    }
-  }
-  
-  coordinatorLoop().catch(e=>console.error('[coordinator]', e.message));
-})(); + d.entry.toFixed(2) + ' | ' +
-      'Target: 
-
-/* --------------------------- Runner ----------------------------------- */
-(async () => {
-  console.log(`HTTP+WS @ :${PORT}  IBKR=${IBKR_HOST}/v1/api`);
-  
-  try {
-    await primeIB();
-    await setMarketDataLive();
-  } catch (e) {
-    console.error('[boot]', e?.response?.data || e.message || e);
-  }
-  
-  server.listen(PORT, () => console.log('[server] listening on :'+PORT));
-  
-  async function coordinatorLoop(){
-    while(true){
-      const futs = ['/ES','/NQ'];
-      const eqs = ['SPY','QQQ','AAPL','TSLA'];
-      
-      // Process futures
-      for (const f of futs) await loopFuturesSymbol(f);
-      
-      // Process equities
-      for (const s of eqs) await loopEquitySymbol(s);
-      
-      // Poll live quotes
-      await pollLiveQuotes();
-      
-      // Monitor auto-trade positions
-      await monitorPositions();
-      
-      await sleep(1500);
-    }
-  }
-  
-  coordinatorLoop().catch(e=>console.error('[coordinator]', e.message));
-})(); + d.profitTarget.toFixed(2) + ' | Stop: 
-
-/* --------------------------- Runner ----------------------------------- */
-(async () => {
-  console.log(`HTTP+WS @ :${PORT}  IBKR=${IBKR_HOST}/v1/api`);
-  
-  try {
-    await primeIB();
-    await setMarketDataLive();
-  } catch (e) {
-    console.error('[boot]', e?.response?.data || e.message || e);
-  }
-  
-  server.listen(PORT, () => console.log('[server] listening on :'+PORT));
-  
-  async function coordinatorLoop(){
-    while(true){
-      const futs = ['/ES','/NQ'];
-      const eqs = ['SPY','QQQ','AAPL','TSLA'];
-      
-      // Process futures
-      for (const f of futs) await loopFuturesSymbol(f);
-      
-      // Process equities
-      for (const s of eqs) await loopEquitySymbol(s);
-      
-      // Poll live quotes
-      await pollLiveQuotes();
-      
-      // Monitor auto-trade positions
-      await monitorPositions();
-      
-      await sleep(1500);
-    }
-  }
-  
-  coordinatorLoop().catch(e=>console.error('[coordinator]', e.message));
-})(); + d.stopLoss.toFixed(2) +
-      '<br/><small>Reasoning: ' + d.reasoning.join(', ') + '</small>' +
-      '</div>';
-    out.insertBefore(div.firstElementChild,out.firstChild);
-    refreshStatus();
-  } else if(d.type==='AUTO_TRADE_CLOSED'){
-    const div=document.createElement('div');
-    const pnlColor = parseFloat(d.pnl) >= 0 ? '#0f0' : '#f00';
-    div.innerHTML = '<div class="row auto-trade">'+
-      '🔄 POSITION CLOSED: ' + d.symbol + ' | ' +
-      '<span style="color:' + pnlColor + '">P&L: ' + d.pnl + ' (
-
-/* --------------------------- Runner ----------------------------------- */
-(async () => {
-  console.log(`HTTP+WS @ :${PORT}  IBKR=${IBKR_HOST}/v1/api`);
-  
-  try {
-    await primeIB();
-    await setMarketDataLive();
-  } catch (e) {
-    console.error('[boot]', e?.response?.data || e.message || e);
-  }
-  
-  server.listen(PORT, () => console.log('[server] listening on :'+PORT));
-  
-  async function coordinatorLoop(){
-    while(true){
-      const futs = ['/ES','/NQ'];
-      const eqs = ['SPY','QQQ','AAPL','TSLA'];
-      
-      // Process futures
-      for (const f of futs) await loopFuturesSymbol(f);
-      
-      // Process equities
-      for (const s of eqs) await loopEquitySymbol(s);
-      
-      // Poll live quotes
-      await pollLiveQuotes();
-      
-      // Monitor auto-trade positions
-      await monitorPositions();
-      
-      await sleep(1500);
-    }
-  }
-  
-  coordinatorLoop().catch(e=>console.error('[coordinator]', e.message));
-})(); + d.dollarPnl + ')</span> | ' +
-      'Reason: ' + d.reason +
-      '</div>';
-    out.insertBefore(div.firstElementChild,out.firstChild);
-    refreshStatus();
-  }
-};
-
-setInterval(() => {
-  if (ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({action: 'get_mappings'}));
-  }
-}, 30000);
-</script>
-</body></html>`);
+      setInterval(refreshStatus, 5000);
+    })();
+  </script>
+</body>
+</html>`);
 });
 
 /* --------------------------- Runner ----------------------------------- */
 (async () => {
   console.log(`HTTP+WS @ :${PORT}  IBKR=${IBKR_HOST}/v1/api`);
-  
+
   try {
     await primeIB();
     await setMarketDataLive();
   } catch (e) {
     console.error('[boot]', e?.response?.data || e.message || e);
   }
-  
-  server.listen(PORT, () => console.log('[server] listening on :'+PORT));
-  
+
+  server.listen(PORT, () => console.log('[server] listening on :' + PORT));
+
   async function coordinatorLoop(){
     while(true){
       const futs = ['/ES','/NQ'];
       const eqs = ['SPY','QQQ','AAPL','TSLA'];
-      
-      // Process futures
+
       for (const f of futs) await loopFuturesSymbol(f);
-      
-      // Process equities
       for (const s of eqs) await loopEquitySymbol(s);
-      
-      // Poll live quotes
+
       await pollLiveQuotes();
-      
-      // Monitor auto-trade positions
       await monitorPositions();
-      
+
       await sleep(1500);
     }
   }
-  
+
   coordinatorLoop().catch(e=>console.error('[coordinator]', e.message));
 })();
