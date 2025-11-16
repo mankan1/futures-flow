@@ -106,6 +106,10 @@ const AUTOTRADE = {
 
 /* Account id (optional). If omitted, we’ll try /iserver/accounts */
 let IB_ACCOUNT_ID = process.env.IBKR_ACCOUNT_ID || null;
+/* ------------------------ Enhanced Historical Data Storage & Analysis ------------------------ */
+
+// Enhanced historical data storage with full array of data points
+const enhancedHistoricalData = new Map(); // conid -> { data: [], stats: {}, patterns: {} }
 
 /* --------------------------- State ------------------------------------- */
 const historicalData = new Map(); // conid -> [{date, oi, volume, ts}]
@@ -177,13 +181,130 @@ function dte(dateUtc){
   return Math.ceil((dateUtc - new Date()) / 86400000);
 }
 
-/* ------------------------ History (12 days) ---------------------------- */
-function storeHistoricalData(conid, oi, volume){
-  const ts = Date.now();
-  const arr = historicalData.get(conid) || [];
-  arr.push({ date: todayKey(), oi:+oi||0, volume:+volume||0, ts });
-  const cutoff = ts - 12*24*60*60*1000;
-  historicalData.set(conid, arr.filter(x=>x.ts >= cutoff));
+/**
+ * Get enhanced historical statistics
+ */
+function getEnhancedHistoricalAverages(conid) {
+    const record = enhancedHistoricalData.get(conid);
+    if (!record || !record.data.length) {
+        return { 
+            avgOI: 0, 
+            avgVolume: 0, 
+            dataPoints: 0,
+            oiStdDev: 0,
+            volumeStdDev: 0,
+            maxOI: 0,
+            maxVolume: 0,
+            minOI: 0,
+            minVolume: 0
+        };
+    }
+    
+    return record.stats;
+}
+
+/**
+ * Update comprehensive historical statistics
+ */
+function updateHistoricalStats(conid) {
+    const record = enhancedHistoricalData.get(conid);
+    if (!record || !record.data.length) return;
+    
+    const data = record.data;
+    const oiValues = data.map(d => d.oi).filter(oi => oi > 0);
+    const volumeValues = data.map(d => d.volume).filter(vol => vol > 0);
+    
+    // Basic averages
+    const avgOI = oiValues.length ? oiValues.reduce((a, b) => a + b, 0) / oiValues.length : 0;
+    const avgVolume = volumeValues.length ? volumeValues.reduce((a, b) => a + b, 0) / volumeValues.length : 0;
+    
+    // Standard deviations
+    const oiVariance = oiValues.length ? 
+        oiValues.reduce((acc, val) => acc + Math.pow(val - avgOI, 2), 0) / oiValues.length : 0;
+    const volumeVariance = volumeValues.length ? 
+        volumeValues.reduce((acc, val) => acc + Math.pow(val - avgVolume, 2), 0) / volumeValues.length : 0;
+    
+    record.stats = {
+        avgOI: Math.round(avgOI),
+        avgVolume: Math.round(avgVolume),
+        dataPoints: data.length,
+        oiStdDev: Math.sqrt(oiVariance),
+        volumeStdDev: Math.sqrt(volumeVariance),
+        maxOI: oiValues.length ? Math.max(...oiValues) : 0,
+        maxVolume: volumeValues.length ? Math.max(...volumeValues) : 0,
+        minOI: oiValues.length ? Math.min(...oiValues) : 0,
+        minVolume: volumeValues.length ? Math.min(...volumeValues) : 0,
+        // Additional metrics traders care about
+        oiRange: oiValues.length ? Math.max(...oiValues) - Math.min(...oiValues) : 0,
+        volumeRange: volumeValues.length ? Math.max(...volumeValues) - Math.min(...volumeValues) : 0,
+        oiVolatility: oiValues.length ? (Math.sqrt(oiVariance) / avgOI) * 100 : 0,
+        volumeVolatility: volumeValues.length ? (Math.sqrt(volumeVariance) / avgVolume) * 100 : 0
+    };
+}
+
+// /* ------------------------ History (12 days) ---------------------------- */
+// function storeHistoricalData(conid, oi, volume){
+//   const ts = Date.now();
+//   const arr = historicalData.get(conid) || [];
+//   arr.push({ date: todayKey(), oi:+oi||0, volume:+volume||0, ts });
+//   const cutoff = ts - 12*24*60*60*1000;
+//   historicalData.set(conid, arr.filter(x=>x.ts >= cutoff));
+// }
+/**
+ * Store comprehensive historical data with full data points
+ */
+function storeHistoricalData(conid, oi, volume, price = null, timestamp = Date.now()) {
+    if (!enhancedHistoricalData.has(conid)) {
+        enhancedHistoricalData.set(conid, {
+            data: [],
+            stats: {},
+            patterns: {},
+            lastUpdated: timestamp
+        });
+    }
+    
+    const historicalRecord = enhancedHistoricalData.get(conid);
+    const dateKey = new Date(timestamp).toISOString().split('T')[0];
+    
+    // Check if we already have data for this date
+    const existingIndex = historicalRecord.data.findIndex(item => 
+        new Date(item.timestamp).toISOString().split('T')[0] === dateKey
+    );
+    
+    const dataPoint = {
+        date: dateKey,
+        timestamp: timestamp,
+        oi: +oi || 0,
+        volume: +volume || 0,
+        price: price || null,
+        dateObj: new Date(timestamp)
+    };
+    
+    if (existingIndex >= 0) {
+        // Update existing day's data (use latest values)
+        historicalRecord.data[existingIndex] = {
+            ...historicalRecord.data[existingIndex],
+            oi: +oi || historicalRecord.data[existingIndex].oi,
+            volume: +volume || historicalRecord.data[existingIndex].volume,
+            price: price || historicalRecord.data[existingIndex].price
+        };
+    } else {
+        // Add new data point
+        historicalRecord.data.push(dataPoint);
+    }
+    
+    // Keep only last 30 days of data for performance
+    const thirtyDaysAgo = timestamp - (30 * 24 * 60 * 60 * 1000);
+    historicalRecord.data = historicalRecord.data.filter(item => item.timestamp >= thirtyDaysAgo);
+    
+    // Sort by timestamp (oldest first)
+    historicalRecord.data.sort((a, b) => a.timestamp - b.timestamp);
+    
+    // Update statistics and patterns
+    updateHistoricalStats(conid);
+    analyzeHistoricalPatterns(conid);
+    
+    historicalRecord.lastUpdated = timestamp;
 }
 
 function getHistoricalAverages(conid){
@@ -271,16 +392,276 @@ function classifySizeTags(trade, isFuture){
   return out.length ? out : ['REGULAR'];
 }
 
-function classifyTradeUWStyle(trade, oi, vol, hist){
-  const isAggBuy = !!trade.aggressor;
-  if (trade.size > (oi + vol)) return isAggBuy ? 'BTO' : 'STO';
-  const volRatio = hist.avgVolume > 0 ? (vol / hist.avgVolume) : 1;
-  const oiChange = oi - (hist.avgOI || 0);
-  const spike = volRatio >= 2;
-  if (spike && oiChange > 0) return isAggBuy ? 'BTO' : 'STO';
-  if (spike && oiChange <= 0) return isAggBuy ? 'BTC' : 'STC';
-  if (oi > 0 && trade.size/oi > 0.4) return isAggBuy ? 'BTO' : 'STO';
-  return isAggBuy ? 'BTC' : 'STC';
+// function classifyTradeUWStyle(trade, oi, vol, hist){
+//   const isAggBuy = !!trade.aggressor;
+//   if (trade.size > (oi + vol)) return isAggBuy ? 'BTO' : 'STO';
+//   const volRatio = hist.avgVolume > 0 ? (vol / hist.avgVolume) : 1;
+//   const oiChange = oi - (hist.avgOI || 0);
+//   const spike = volRatio >= 2;
+//   if (spike && oiChange > 0) return isAggBuy ? 'BTO' : 'STO';
+//   if (spike && oiChange <= 0) return isAggBuy ? 'BTC' : 'STC';
+//   if (oi > 0 && trade.size/oi > 0.4) return isAggBuy ? 'BTO' : 'STO';
+//   return isAggBuy ? 'BTC' : 'STC';
+// }
+
+/**
+ * Analyze volume clusters (identify common trading levels)
+ */
+function analyzeVolumeClusters(data) {
+    if (data.length < 5) return [];
+    
+    const volumes = data.map(d => d.volume).filter(v => v > 0);
+    const avgVolume = volumes.reduce((a, b) => a + b, 0) / volumes.length;
+    
+    const clusters = [
+        { range: 'Very High', min: avgVolume * 3, count: 0 },
+        { range: 'High', min: avgVolume * 1.5, max: avgVolume * 3, count: 0 },
+        { range: 'Normal', min: avgVolume * 0.5, max: avgVolume * 1.5, count: 0 },
+        { range: 'Low', max: avgVolume * 0.5, count: 0 }
+    ];
+    
+    volumes.forEach(volume => {
+        for (const cluster of clusters) {
+            const aboveMin = cluster.min === undefined || volume >= cluster.min;
+            const belowMax = cluster.max === undefined || volume <= cluster.max;
+            if (aboveMin && belowMax) {
+                cluster.count++;
+                break;
+            }
+        }
+    });
+    
+    return clusters;
+}
+/**
+ * Get recent historical data points (last N days)
+ */
+function getRecentHistoricalData(conid, days = 5) {
+    const record = enhancedHistoricalData.get(conid);
+    if (!record || !record.data.length) return [];
+    
+    const cutoff = Date.now() - (days * 24 * 60 * 60 * 1000);
+    return record.data.filter(item => item.timestamp >= cutoff);
+}
+
+/**
+ * Get OI trend with multiple timeframes
+ */
+function getOITrendMultiTimeframe(conid) {
+    const record = enhancedHistoricalData.get(conid);
+    if (!record || record.data.length < 3) return { short: 'neutral', medium: 'neutral', long: 'neutral' };
+    
+    const oiSeries = record.data.map(d => d.oi);
+    
+    return {
+        short: analyzeTrend(oiSeries, 3),    // 3 days
+        medium: analyzeTrend(oiSeries, 7),   // 1 week
+        long: analyzeTrend(oiSeries, 14)     // 2 weeks
+    };
+}
+
+/**
+ * Calculate volume-weighted metrics
+ */
+function getVolumeWeightedMetrics(conid) {
+    const record = enhancedHistoricalData.get(conid);
+    if (!record || !record.data.length) return null;
+    
+    const data = record.data;
+    let totalVolume = 0;
+    let volumeWeightedOI = 0;
+    
+    data.forEach(day => {
+        totalVolume += day.volume;
+        volumeWeightedOI += day.oi * day.volume;
+    });
+    
+    return {
+        volumeWeightedAvgOI: totalVolume > 0 ? volumeWeightedOI / totalVolume : 0,
+        totalVolume: totalVolume,
+        avgDailyVolume: totalVolume / data.length
+    };
+}
+
+/**
+ * Analyze trend direction from data series
+ */
+function analyzeTrend(dataSeries, lookbackPeriod = 5) {
+    if (dataSeries.length < lookbackPeriod) return 'neutral';
+    
+    const recentData = dataSeries.slice(-lookbackPeriod);
+    let increases = 0;
+    let decreases = 0;
+    
+    for (let i = 1; i < recentData.length; i++) {
+        if (recentData[i] > recentData[i-1]) increases++;
+        else if (recentData[i] < recentData[i-1]) decreases++;
+    }
+    
+    if (increases >= lookbackPeriod - 1) return 'strong_uptrend';
+    if (decreases >= lookbackPeriod - 1) return 'strong_downtrend';
+    if (increases > decreases * 2) return 'uptrend';
+    if (decreases > increases * 2) return 'downtrend';
+    return 'neutral';
+}
+
+/**
+ * Count distribution days (OI decreasing with volume)
+ */
+function countDistributionDays(data) {
+    let count = 0;
+    for (let i = 1; i < data.length; i++) {
+        if (data[i].oi < data[i-1].oi && data[i].volume > data[i-1].volume * 0.8) {
+            count++;
+        }
+    }
+    return count;
+}
+
+/**
+ * Detect recent activity spike (last 2 days > 3x average)
+ */
+function detectRecentActivitySpike(data, stats) {
+    if (data.length < 2 || !stats.avgVolume) return false;
+    const recentDays = data.slice(-2);
+    return recentDays.some(day => day.volume > stats.avgVolume * 3);
+}
+
+/**
+ * Count days with unusual activity (volume > 2x average)
+ */
+function countUnusualActivityDays(data, stats) {
+    if (!stats.avgVolume) return 0;
+    return data.filter(day => day.volume > stats.avgVolume * 2).length;
+}
+/**
+ * Count accumulation days (OI increasing with volume)
+ */
+function countAccumulationDays(data) {
+    let count = 0;
+    for (let i = 1; i < data.length; i++) {
+        if (data[i].oi > data[i-1].oi && data[i].volume > data[i-1].volume * 0.8) {
+            count++;
+        }
+    }
+    return count;
+}
+
+/**
+ * Analyze historical patterns for trading insights
+ */
+function analyzeHistoricalPatterns(conid) {
+    const record = enhancedHistoricalData.get(conid);
+    if (!record || record.data.length < 5) return;
+    
+    const data = record.data;
+    const patterns = {
+        oiTrend: 'neutral',
+        volumeTrend: 'neutral',
+        accumulationDays: 0,
+        distributionDays: 0,
+        unusualActivityDays: 0,
+        recentActivitySpike: false,
+        supportResistanceLevels: [],
+        volumeClusters: []
+    };
+    
+    // Analyze OI and Volume trends
+    patterns.oiTrend = analyzeTrend(data.map(d => d.oi));
+    patterns.volumeTrend = analyzeTrend(data.map(d => d.volume));
+    
+    // Count accumulation/distribution days
+    patterns.accumulationDays = countAccumulationDays(data);
+    patterns.distributionDays = countDistributionDays(data);
+    
+    // Detect unusual activity
+    patterns.unusualActivityDays = countUnusualActivityDays(data, record.stats);
+    patterns.recentActivitySpike = detectRecentActivitySpike(data, record.stats);
+    
+    // Volume cluster analysis (where is most trading happening?)
+    patterns.volumeClusters = analyzeVolumeClusters(data);
+    
+    record.patterns = patterns;
+}
+
+/**
+/* ------------------------ Enhanced Classification Functions ------------------------ */
+
+/**
+ * Comprehensive historical pattern analysis for trade classification
+ */
+function analyzeHistoricalPattern(conid, currentOi, currentVol, tradeSize) {
+    const record = enhancedHistoricalData.get(conid);
+    const stats = record?.stats || { avgVolume: 0, avgOI: 0 };
+    const patterns = record?.patterns || {};
+    
+    const volumeSpike = currentVol > (stats.avgVolume * 2);
+    const oiSpike = currentOi > (stats.avgOI * 1.5);
+    const largeTradeRelativeToOi = currentOi > 0 ? (tradeSize / currentOi > 0.25) : false;
+    
+    // Get multi-timeframe OI trends
+    const oiTrends = getOITrendMultiTimeframe(conid);
+    
+    // Check for recent OI buildup pattern
+    const hasRecentOIBuildup = checkRecentOIBuildup(conid);
+    
+    // Check if this is consistent with recent patterns
+    const consistentWithPattern = checkConsistencyWithPattern(conid, currentOi, currentVol, tradeSize);
+    
+    return {
+        volumeSpike,
+        oiSpike,
+        largeTradeRelativeToOi,
+        hasRecentOIBuildup,
+        unusualActivity: currentVol > (stats.avgVolume * 5) || tradeSize > (stats.avgVolume * 10),
+        oiTrendShort: oiTrends.short,
+        oiTrendMedium: oiTrends.medium,
+        consistentWithPattern,
+        accumulationPattern: patterns.accumulationDays > patterns.distributionDays,
+        distributionPattern: patterns.distributionDays > patterns.accumulationDays,
+        recentActivitySpike: patterns.recentActivitySpike
+    };
+}
+
+/**
+ * Check for recent OI buildup (last 3-5 days)
+ */
+function checkRecentOIBuildup(conid) {
+    const recentData = getRecentHistoricalData(conid, 5);
+    if (recentData.length < 3) return false;
+    
+    let oiIncreases = 0;
+    for (let i = 1; i < recentData.length; i++) {
+        if (recentData[i].oi > recentData[i-1].oi) {
+            oiIncreases++;
+        }
+    }
+    
+    return oiIncreases >= recentData.length - 1;
+}
+
+/**
+ * Check if current activity is consistent with recent patterns
+ */
+function checkConsistencyWithPattern(conid, currentOi, currentVol, tradeSize) {
+    const record = enhancedHistoricalData.get(conid);
+    if (!record || record.data.length < 5) return true; // Default to consistent if not enough data
+    
+    const recentData = getRecentHistoricalData(conid, 5);
+    const recentOIs = recentData.map(d => d.oi);
+    const recentVolumes = recentData.map(d => d.volume);
+    
+    const avgRecentOI = recentOIs.reduce((a, b) => a + b, 0) / recentOIs.length;
+    const avgRecentVolume = recentVolumes.reduce((a, b) => a + b, 0) / recentVolumes.length;
+    
+    // Check if current values are within 2 standard deviations of recent averages
+    const oiStdDev = Math.sqrt(recentOIs.reduce((acc, oi) => acc + Math.pow(oi - avgRecentOI, 2), 0) / recentOIs.length);
+    const volumeStdDev = Math.sqrt(recentVolumes.reduce((acc, vol) => acc + Math.pow(vol - avgRecentVolume, 2), 0) / recentVolumes.length);
+    
+    const oiConsistent = Math.abs(currentOi - avgRecentOI) <= (2 * oiStdDev);
+    const volumeConsistent = Math.abs(currentVol - avgRecentVolume) <= (2 * volumeStdDev);
+    
+    return oiConsistent && volumeConsistent;
 }
 
 function confidenceScore(trade, oi, vol, hist){
@@ -823,97 +1204,304 @@ function stanceForOptionPrint({
   return { score, label, reasons };
 }
 
-/* ===================== Trade Payload Builder ===================== */
-function buildTradePayload({ optionMeta, isFuture, ulConid, ul, optRow, multiplier }){
-  const last  = px(optRow['31']);
-  const bid   = px(optRow['84']);
-  const ask   = px(optRow['86']);
-  const vol   = +optRow['7762'] || 0;
-  const oi    = optionMeta.oi ?? 0;
-  const greeks = calcGreeks(optRow);
+/**
+ * Enhanced trader-classification logic
+ */
+function classifyTradeUWStyle(trade, currentOi, currentVol, hist) {
+    const isAggBuy = !!trade.aggressor;
+    
+    // Get comprehensive historical context
+    const historicalContext = analyzeHistoricalPattern(trade.conid, currentOi, currentVol, trade.size);
+    
+    // Rule 1: If trade size > (OI + current volume), it's definitely opening
+    if (trade.size > (currentOi + currentVol)) {
+        return isAggBuy ? 'BTO' : 'STO';
+    }
+    
+    // Rule 2: Volume spike analysis with historical context
+    const volumeSpike = historicalContext.volumeSpike;
+    const oiIncrease = currentOi > (hist.avgOI * 1.2);
+    
+    // TRADER LOGIC: Multi-factor classification
+    
+    // SCENARIO 1: Strong accumulation pattern - OPENING
+    if (volumeSpike && oiIncrease && historicalContext.accumulationPattern) {
+        // High volume, OI increasing, in accumulation phase = new positions
+        console.log(`[TRADE-CLASS] Accumulation pattern detected for ${trade.symbol}: BTO/STO`);
+        return isAggBuy ? 'BTO' : 'STO';
+    }
+    
+    // SCENARIO 2: Distribution pattern with volume spike - CLOSING
+    if (volumeSpike && !oiIncrease && historicalContext.distributionPattern) {
+        // High volume, OI not increasing, in distribution phase = closing positions
+        console.log(`[TRADE-CLASS] Distribution pattern detected for ${trade.symbol}: BTC/STC`);
+        return isAggBuy ? 'BTC' : 'STC';
+    }
+    
+    // SCENARIO 3: Recent OI buildup followed by volume spike - PROFIT TAKING (CLOSING)
+    if (volumeSpike && historicalContext.hasRecentOIBuildup && !oiIncrease) {
+        // Built up positions now being liquidated
+        console.log(`[TRADE-CLASS] Profit-taking detected for ${trade.symbol} after OI buildup: BTC/STC`);
+        return isAggBuy ? 'BTC' : 'STC';
+    }
+    
+    // SCENARIO 4: Volume spike with stable OI - POSITION ADJUSTMENTS (likely closing)
+    if (volumeSpike && Math.abs(currentOi - hist.avgOI) / hist.avgOI < 0.1) {
+        // Volume spike but OI unchanged = rolling positions (closing old, opening new)
+        // More weight to closing since we're seeing the closing leg
+        console.log(`[TRADE-CLASS] Position adjustment detected for ${trade.symbol}: BTC/STC`);
+        return isAggBuy ? 'BTC' : 'STC';
+    }
+    
+    // SCENARIO 5: Large trade relative to OI in uptrend - OPENING
+    if (historicalContext.largeTradeRelativeToOi && historicalContext.oiTrendMedium === 'uptrend') {
+        // Large trade during uptrend = new positions being opened
+        console.log(`[TRADE-CLASS] Large opening trade detected in uptrend for ${trade.symbol}: BTO/STO`);
+        return isAggBuy ? 'BTO' : 'STO';
+    }
+    
+    // SCENARIO 6: Unusual activity inconsistent with pattern - likely OPENING
+    if (historicalContext.unusualActivity && !historicalContext.consistentWithPattern) {
+        // Break from normal pattern = likely new institutional activity
+        console.log(`[TRADE-CLASS] Unusual activity break detected for ${trade.symbol}: BTO/STO`);
+        return isAggBuy ? 'BTO' : 'STO';
+    }
+    
+    // DEFAULT: Use trend-following logic
+    if (historicalContext.oiTrendShort === 'uptrend') {
+        return isAggBuy ? 'BTO' : 'STO';
+    } else if (historicalContext.oiTrendShort === 'downtrend') {
+        return isAggBuy ? 'BTC' : 'STC';
+    }
+    
+    // Fallback to basic aggressor logic
+    console.log(`[TRADE-CLASS] Using fallback classification for ${trade.symbol}`);
+    return isAggBuy ? 'BTC' : 'STC';
+}
 
-  const size = vol;
-  const premium = last * size * multiplier;
-  const aggressor = last >= ask ? true
+/* ------------------------ Enhanced Trade Payload with Historical Insights ------------------------ */
+
+function buildTradePayload({ optionMeta, isFuture, ulConid, ul, optRow, multiplier }) {
+    const last  = px(optRow['31']);
+    const bid   = px(optRow['84']);
+    const ask   = px(optRow['86']);
+    const vol   = +optRow['7762'] || 0;
+    const oi    = optionMeta.oi ?? 0;
+    const greeks = calcGreeks(optRow);
+
+    const size = vol;
+    const premium = last * size * multiplier;
+    const aggressor = last >= ask ? true
                    : last <= bid ? false
                    : (ask && bid ? (Math.abs(last - ask) < Math.abs(last - bid)) : true);
-  const volOiRatio = oi > 0 ? (vol / oi) : vol;
+    const volOiRatio = oi > 0 ? (vol / oi) : vol;
 
-  if (oi != null) storeHistoricalData(optionMeta.conid, oi, vol);
-  const hist = getHistoricalAverages(optionMeta.conid);
+    // Store enhanced historical data
+    storeHistoricalData(optionMeta.conid, oi, vol, last);
+    
+    const hist = getEnhancedHistoricalAverages(optionMeta.conid);
+    const historicalContext = analyzeHistoricalPattern(optionMeta.conid, oi, vol, size);
+    const oiTrends = getOITrendMultiTimeframe(optionMeta.conid);
+    const volumeMetrics = getVolumeWeightedMetrics(optionMeta.conid);
+    
+    const record = enhancedHistoricalData.get(optionMeta.conid);
+    const patterns = record?.patterns || {};
 
-  const type = optionMeta.right === 'C' ? 'CALL' : 'PUT';
+    const type = optionMeta.right === 'C' ? 'CALL' : 'PUT';
 
-  const trade = {
-    symbol: optionMeta.symbol,
-    assetClass: isFuture ? 'FUTURES_OPTION' : 'EQUITY_OPTION',
-    conid: optionMeta.conid,
-    type,
-    strike: optionMeta.strike,
-    expiry: optionMeta.expiry,
-    optionPrice: last,
-    bid,
-    ask,
-    size,
-    openInterest: oi,
-    premium,
-    aggressor,
-    underlyingConid: ulConid,
-    underlyingPrice: ul.price,
-    multiplier,
-    exchange: optionMeta.exchange || (isFuture ? 'CME' : 'SMART'),
-    timestamp: nowISO(),
-    greeks,
-    volOiRatio
-  };
+    const trade = {
+        symbol: optionMeta.symbol,
+        assetClass: isFuture ? 'FUTURES_OPTION' : 'EQUITY_OPTION',
+        conid: optionMeta.conid,
+        type,
+        strike: optionMeta.strike,
+        expiry: optionMeta.expiry,
+        optionPrice: last,
+        bid,
+        ask,
+        size,
+        openInterest: oi,
+        premium,
+        aggressor,
+        underlyingConid: ulConid,
+        underlyingPrice: ul.price,
+        multiplier,
+        exchange: optionMeta.exchange || (isFuture ? 'CME' : 'SMART'),
+        timestamp: nowISO(),
+        greeks,
+        volOiRatio
+    };
 
-  const direction  = classifyTradeUWStyle(trade, oi, vol, hist);
-  const confidence = confidenceScore(trade, oi, vol, hist);
-  const tags       = classifySizeTags(trade, isFuture);
+    const direction  = classifyTradeUWStyle(trade, oi, vol, hist);
+    const confidence = confidenceScore(trade, oi, vol, hist);
+    const tags       = classifySizeTags(trade, isFuture);
 
-  const mny = (optionMeta.strike && ul.price) ? (optionMeta.strike / ul.price) : null;
-  const dteDays = optionMeta.expiry
-    ? Math.ceil((parseYYYYMMDD(String(optionMeta.expiry)) - new Date())/86400000)
-    : null;
+    const mny = (optionMeta.strike && ul.price) ? (optionMeta.strike / ul.price) : null;
+    const dteDays = optionMeta.expiry
+        ? Math.ceil((parseYYYYMMDD(String(optionMeta.expiry)) - new Date())/86400000)
+        : null;
 
-  const { score: stanceScore, label: stanceLabel, reasons: stanceReasons } = stanceForOptionPrint({
-    right: type,
-    aggressor,
-    direction,
-    delta: greeks?.delta ?? null,
-    moneyness: mny,
-    dte: dteDays,
-    volOiRatio,
-    size,
-    premium
-  });
+    const { score: stanceScore, label: stanceLabel, reasons: stanceReasons } = stanceForOptionPrint({
+        right: type,
+        aggressor,
+        direction,
+        delta: greeks?.delta ?? null,
+        moneyness: mny,
+        dte: dteDays,
+        volOiRatio,
+        size,
+        premium
+    });
 
-  return {
-    payload: {
-      type: 'TRADE',
-      ...trade,
-      direction,
-      confidence,
-      classifications: tags,
-      stanceScore,
-      stanceLabel,
-      stanceReasons,
-      dte: dteDays,
-      moneyness: mny,
-      historicalComparison: {
-        avgOI: Math.round(hist.avgOI),
-        avgVolume: Math.round(hist.avgVolume),
-        oiChange: Math.round(oi - (hist.avgOI||0)),
-        volumeMultiple: hist.avgVolume>0 ? +(vol/hist.avgVolume).toFixed(2) : null,
-        dataPoints: hist.dataPoints
-      },
-      marketSession: isFuture
-        ? (isFuturesMarketOpen() ? 'OPEN' : 'CLOSED')
-        : (isEquityMarketOpen() ? 'REGULAR/EXTENDED' : 'CLOSED')
-    },
-    optRow
-  };
+    return {
+        payload: {
+            type: 'TRADE',
+            ...trade,
+            direction,
+            confidence,
+            classifications: tags,
+            stanceScore,
+            stanceLabel,
+            stanceReasons,
+            dte: dteDays,
+            moneyness: mny,
+            historicalAnalysis: {
+                // Basic stats
+                avgOI: Math.round(hist.avgOI),
+                avgVolume: Math.round(hist.avgVolume),
+                oiChange: Math.round(oi - (hist.avgOI||0)),
+                oiChangePercent: hist.avgOI > 0 ? +((oi - hist.avgOI) / hist.avgOI * 100).toFixed(1) : 0,
+                volumeMultiple: hist.avgVolume>0 ? +(vol/hist.avgVolume).toFixed(2) : null,
+                dataPoints: hist.dataPoints,
+                
+                // Enhanced metrics
+                oiStdDev: +(hist.oiStdDev || 0).toFixed(0),
+                volumeStdDev: +(hist.volumeStdDev || 0).toFixed(0),
+                oiVolatility: +(hist.oiVolatility || 0).toFixed(1),
+                volumeVolatility: +(hist.volumeVolatility || 0).toFixed(1),
+                
+                // Trend analysis
+                oiTrendShort: oiTrends.short,
+                oiTrendMedium: oiTrends.medium,
+                oiTrendLong: oiTrends.long,
+                volumeTrend: patterns.volumeTrend,
+                
+                // Pattern recognition
+                accumulationDays: patterns.accumulationDays || 0,
+                distributionDays: patterns.distributionDays || 0,
+                unusualActivityDays: patterns.unusualActivityDays || 0,
+                recentActivitySpike: patterns.recentActivitySpike || false,
+                hasRecentOIBuildup: historicalContext.hasRecentOIBuildup,
+                
+                // Volume analysis
+                volumeWeightedAvgOI: volumeMetrics ? Math.round(volumeMetrics.volumeWeightedAvgOI) : 0,
+                totalVolume: volumeMetrics ? Math.round(volumeMetrics.totalVolume) : 0,
+                
+                // Context flags
+                volumeSpike: historicalContext.volumeSpike,
+                oiSpike: historicalContext.oiSpike,
+                unusualActivity: historicalContext.unusualActivity,
+                consistentWithPattern: historicalContext.consistentWithPattern
+            },
+            marketSession: isFuture
+                ? (isFuturesMarketOpen() ? 'OPEN' : 'CLOSED')
+                : (isEquityMarketOpen() ? 'REGULAR/EXTENDED' : 'CLOSED')
+        },
+        optRow
+    };
 }
+
+/* ===================== Trade Payload Builder ===================== */
+// function buildTradePayload({ optionMeta, isFuture, ulConid, ul, optRow, multiplier }){
+//   const last  = px(optRow['31']);
+//   const bid   = px(optRow['84']);
+//   const ask   = px(optRow['86']);
+//   const vol   = +optRow['7762'] || 0;
+//   const oi    = optionMeta.oi ?? 0;
+//   const greeks = calcGreeks(optRow);
+
+//   const size = vol;
+//   const premium = last * size * multiplier;
+//   const aggressor = last >= ask ? true
+//                    : last <= bid ? false
+//                    : (ask && bid ? (Math.abs(last - ask) < Math.abs(last - bid)) : true);
+//   const volOiRatio = oi > 0 ? (vol / oi) : vol;
+
+//   if (oi != null) storeHistoricalData(optionMeta.conid, oi, vol);
+//   const hist = getHistoricalAverages(optionMeta.conid);
+
+//   const type = optionMeta.right === 'C' ? 'CALL' : 'PUT';
+
+//   const trade = {
+//     symbol: optionMeta.symbol,
+//     assetClass: isFuture ? 'FUTURES_OPTION' : 'EQUITY_OPTION',
+//     conid: optionMeta.conid,
+//     type,
+//     strike: optionMeta.strike,
+//     expiry: optionMeta.expiry,
+//     optionPrice: last,
+//     bid,
+//     ask,
+//     size,
+//     openInterest: oi,
+//     premium,
+//     aggressor,
+//     underlyingConid: ulConid,
+//     underlyingPrice: ul.price,
+//     multiplier,
+//     exchange: optionMeta.exchange || (isFuture ? 'CME' : 'SMART'),
+//     timestamp: nowISO(),
+//     greeks,
+//     volOiRatio
+//   };
+
+//   const direction  = classifyTradeUWStyle(trade, oi, vol, hist);
+//   const confidence = confidenceScore(trade, oi, vol, hist);
+//   const tags       = classifySizeTags(trade, isFuture);
+
+//   const mny = (optionMeta.strike && ul.price) ? (optionMeta.strike / ul.price) : null;
+//   const dteDays = optionMeta.expiry
+//     ? Math.ceil((parseYYYYMMDD(String(optionMeta.expiry)) - new Date())/86400000)
+//     : null;
+
+//   const { score: stanceScore, label: stanceLabel, reasons: stanceReasons } = stanceForOptionPrint({
+//     right: type,
+//     aggressor,
+//     direction,
+//     delta: greeks?.delta ?? null,
+//     moneyness: mny,
+//     dte: dteDays,
+//     volOiRatio,
+//     size,
+//     premium
+//   });
+
+//   return {
+//     payload: {
+//       type: 'TRADE',
+//       ...trade,
+//       direction,
+//       confidence,
+//       classifications: tags,
+//       stanceScore,
+//       stanceLabel,
+//       stanceReasons,
+//       dte: dteDays,
+//       moneyness: mny,
+//       historicalComparison: {
+//         avgOI: Math.round(hist.avgOI),
+//         avgVolume: Math.round(hist.avgVolume),
+//         oiChange: Math.round(oi - (hist.avgOI||0)),
+//         volumeMultiple: hist.avgVolume>0 ? +(vol/hist.avgVolume).toFixed(2) : null,
+//         dataPoints: hist.dataPoints
+//       },
+//       marketSession: isFuture
+//         ? (isFuturesMarketOpen() ? 'OPEN' : 'CLOSED')
+//         : (isEquityMarketOpen() ? 'REGULAR/EXTENDED' : 'CLOSED')
+//     },
+//     optRow
+//   };
+// }
 
 async function processOptionConid(optionMeta, isFuture, ulConid, multiplier) {
   try {
@@ -1551,6 +2139,43 @@ async function placeIbSingleOptionOrder({ conid, side, quantity, isFuture }) {
   return data;
 }
 
+/* ------------------------ Debug Endpoints for Historical Analysis ------------------------ */
+
+app.get('/debug/historical/:conid', (req, res) => {
+    const { conid } = req.params;
+    const record = enhancedHistoricalData.get(parseInt(conid));
+    
+    if (!record) {
+        return res.json({ error: 'No historical data found for conid', conid });
+    }
+    
+    res.json({
+        conid: parseInt(conid),
+        dataPoints: record.data.length,
+        lastUpdated: record.lastUpdated,
+        stats: record.stats,
+        patterns: record.patterns,
+        recentData: record.data.slice(-10), // Last 10 data points
+        oiTrends: getOITrendMultiTimeframe(parseInt(conid)),
+        volumeMetrics: getVolumeWeightedMetrics(parseInt(conid))
+    });
+});
+
+app.get('/debug/historical-stats', (req, res) => {
+    const stats = {};
+    enhancedHistoricalData.forEach((record, conid) => {
+        stats[conid] = {
+            dataPoints: record.data.length,
+            lastUpdated: record.lastUpdated,
+            patterns: record.patterns
+        };
+    });
+    
+    res.json({
+        totalContracts: enhancedHistoricalData.size,
+        stats: stats
+    });
+});
 /* ------------------------- HTTP Routes -------------------------------- */
 app.get('/health', (req,res)=>res.json({ ok:true, ts:Date.now() }));
 
